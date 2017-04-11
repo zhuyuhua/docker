@@ -41,6 +41,8 @@ docker-run - Run a command in a new container
 [**--group-add**[=*[]*]]
 [**-h**|**--hostname**[=*HOSTNAME*]]
 [**--help**]
+[**--init**]
+[**--init-path**[=*[]*]]
 [**-i**|**--interactive**]
 [**--ip**[=*IPv4-ADDRESS*]]
 [**--ip6**[=*IPv6-ADDRESS*]]
@@ -58,7 +60,6 @@ docker-run - Run a command in a new container
 [**--memory-reservation**[=*MEMORY-RESERVATION*]]
 [**--memory-swap**[=*LIMIT*]]
 [**--memory-swappiness**[=*MEMORY-SWAPPINESS*]]
-[**--mount**[=*MOUNT*]]
 [**--name**[=*NAME*]]
 [**--network-alias**[=*[]*]]
 [**--network**[=*"bridge"*]]
@@ -310,7 +311,13 @@ redirection on the host system.
    Sets the container host name that is available inside the container.
 
 **--help**
-  Print usage statement
+   Print usage statement
+
+**--init**
+   Run an init inside the container that forwards signals and reaps processes
+
+**--init-path**=""
+   Path to the docker-init binary
 
 **-i**, **--interactive**=*true*|*false*
    Keep STDIN open even if not attached. The default is *false*.
@@ -320,12 +327,12 @@ redirection on the host system.
 **--ip**=""
    Sets the container's interface IPv4 address (e.g. 172.23.0.9)
 
-   It can only be used in conjunction with **--net** for user-defined networks
+   It can only be used in conjunction with **--network** for user-defined networks
 
 **--ip6**=""
    Sets the container's interface IPv6 address (e.g. 2001:db8::1b99)
 
-   It can only be used in conjunction with **--net** for user-defined networks
+   It can only be used in conjunction with **--network** for user-defined networks
 
 **--ipc**=""
    Default is to create a private IPC namespace (POSIX SysV IPC) for the container
@@ -558,7 +565,7 @@ incompatible with any restart policy other than `none`.
   Network Namespace - current sysctls allowed:
       Sysctls beginning with net.*
 
-  If you use the `--net=host` option these sysctls will not be allowed.
+  If you use the `--network=host` option these sysctls will not be allowed.
 
 **--sig-proxy**=*true*|*false*
    Proxy received signals to the process (non-TTY mode only). SIGCHLD, SIGSTOP, and SIGKILL are not proxied. The default is *true*.
@@ -907,7 +914,7 @@ should fix the problem.
 ## Mapping Ports for External Usage
 
 The exposed port of an application can be mapped to a host port using the **-p**
-flag. For example, a httpd port 80 can be mapped to the host port 8080 using the
+flag. For example, an httpd port 80 can be mapped to the host port 8080 using the
 following:
 
     # docker run -p 8080:80 -d -i -t fedora/httpd

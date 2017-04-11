@@ -84,7 +84,7 @@ func (d *DurationOpt) String() string {
 	if d.value != nil {
 		return d.value.String()
 	}
-	return "none"
+	return ""
 }
 
 // Value returns the time.Duration
@@ -114,7 +114,7 @@ func (i *Uint64Opt) String() string {
 	if i.value != nil {
 		return fmt.Sprintf("%v", *i.value)
 	}
-	return "none"
+	return ""
 }
 
 // Value returns the uint64
@@ -182,7 +182,7 @@ func (o *SecretOpt) Set(value string) error {
 
 		value := parts[1]
 		switch key {
-		case "source":
+		case "source", "src":
 			spec.source = value
 		case "target":
 			tDir, _ := filepath.Split(value)
@@ -287,41 +287,15 @@ func convertNetworks(networks []string) []swarm.NetworkAttachmentConfig {
 }
 
 type endpointOptions struct {
-	mode  string
-	ports opts.ListOpts
+	mode         string
+	publishPorts opts.PortOpt
 }
 
 func (e *endpointOptions) ToEndpointSpec() *swarm.EndpointSpec {
-	portConfigs := []swarm.PortConfig{}
-	// We can ignore errors because the format was already validated by ValidatePort
-	ports, portBindings, _ := nat.ParsePortSpecs(e.ports.GetAll())
-
-	for port := range ports {
-		portConfigs = append(portConfigs, convertPortToPortConfig(port, portBindings)...)
-	}
-
 	return &swarm.EndpointSpec{
 		Mode:  swarm.ResolutionMode(strings.ToLower(e.mode)),
-		Ports: portConfigs,
+		Ports: e.publishPorts.Value(),
 	}
-}
-
-func convertPortToPortConfig(
-	port nat.Port,
-	portBindings map[nat.Port][]nat.PortBinding,
-) []swarm.PortConfig {
-	ports := []swarm.PortConfig{}
-
-	for _, binding := range portBindings[port] {
-		hostPort, _ := strconv.ParseUint(binding.HostPort, 10, 16)
-		ports = append(ports, swarm.PortConfig{
-			//TODO Name: ?
-			Protocol:      swarm.PortConfigProtocol(strings.ToLower(port.Proto())),
-			TargetPort:    uint32(port.Int()),
-			PublishedPort: uint32(hostPort),
-		})
-	}
-	return ports
 }
 
 type logDriverOptions struct {
@@ -397,6 +371,20 @@ func ValidatePort(value string) (string, error) {
 	return value, err
 }
 
+// convertExtraHostsToSwarmHosts converts an array of extra hosts in cli
+//     <host>:<ip>
+// into a swarmkit host format:
+//     IP_address canonical_hostname [aliases...]
+// This assumes input value (<host>:<ip>) has already been validated
+func convertExtraHostsToSwarmHosts(extraHosts []string) []string {
+	hosts := []string{}
+	for _, extraHost := range extraHosts {
+		parts := strings.SplitN(extraHost, ":", 2)
+		hosts = append(hosts, fmt.Sprintf("%s %s", parts[1], parts[0]))
+	}
+	return hosts
+}
+
 type serviceOptions struct {
 	name            string
 	labels          opts.ListOpts
@@ -414,6 +402,7 @@ type serviceOptions struct {
 	dns             opts.ListOpts
 	dnsSearch       opts.ListOpts
 	dnsOption       opts.ListOpts
+	hosts           opts.ListOpts
 
 	resources resourceOptions
 	stopGrace DurationOpt
@@ -442,15 +431,13 @@ func newServiceOptions() *serviceOptions {
 		containerLabels: opts.NewListOpts(runconfigopts.ValidateEnv),
 		env:             opts.NewListOpts(runconfigopts.ValidateEnv),
 		envFile:         opts.NewListOpts(nil),
-		endpoint: endpointOptions{
-			ports: opts.NewListOpts(ValidatePort),
-		},
-		groups:    opts.NewListOpts(nil),
-		logDriver: newLogDriverOptions(),
-		dns:       opts.NewListOpts(opts.ValidateIPAddress),
-		dnsOption: opts.NewListOpts(nil),
-		dnsSearch: opts.NewListOpts(opts.ValidateDNSSearch),
-		networks:  opts.NewListOpts(nil),
+		groups:          opts.NewListOpts(nil),
+		logDriver:       newLogDriverOptions(),
+		dns:             opts.NewListOpts(opts.ValidateIPAddress),
+		dnsOption:       opts.NewListOpts(nil),
+		dnsSearch:       opts.NewListOpts(opts.ValidateDNSSearch),
+		hosts:           opts.NewListOpts(runconfigopts.ValidateExtraHost),
+		networks:        opts.NewListOpts(nil),
 	}
 }
 
@@ -498,6 +485,7 @@ func (opts *serviceOptions) ToService() (swarm.ServiceSpec, error) {
 					Search:      opts.dnsSearch.GetAll(),
 					Options:     opts.dnsOption.GetAll(),
 				},
+				Hosts:           convertExtraHostsToSwarmHosts(opts.hosts.GetAll()),
 				StopGracePeriod: opts.stopGrace.Value(),
 				Secrets:         nil,
 			},
@@ -551,19 +539,20 @@ func addServiceFlags(cmd *cobra.Command, opts *serviceOptions) {
 
 	flags.StringVarP(&opts.workdir, flagWorkdir, "w", "", "Working directory inside the container")
 	flags.StringVarP(&opts.user, flagUser, "u", "", "Username or UID (format: <name|uid>[:<group|gid>])")
+	flags.StringVar(&opts.hostname, flagHostname, "", "Container hostname")
 
 	flags.Var(&opts.resources.limitCPU, flagLimitCPU, "Limit CPUs")
 	flags.Var(&opts.resources.limitMemBytes, flagLimitMemory, "Limit Memory")
 	flags.Var(&opts.resources.resCPU, flagReserveCPU, "Reserve CPUs")
 	flags.Var(&opts.resources.resMemBytes, flagReserveMemory, "Reserve Memory")
-	flags.Var(&opts.stopGrace, flagStopGracePeriod, "Time to wait before force killing a container")
+	flags.Var(&opts.stopGrace, flagStopGracePeriod, "Time to wait before force killing a container (ns|us|ms|s|m|h)")
 
 	flags.Var(&opts.replicas, flagReplicas, "Number of tasks")
 
 	flags.StringVar(&opts.restartPolicy.condition, flagRestartCondition, "", "Restart when condition is met (none, on-failure, or any)")
-	flags.Var(&opts.restartPolicy.delay, flagRestartDelay, "Delay between restart attempts")
+	flags.Var(&opts.restartPolicy.delay, flagRestartDelay, "Delay between restart attempts (ns|us|ms|s|m|h)")
 	flags.Var(&opts.restartPolicy.maxAttempts, flagRestartMaxAttempts, "Maximum number of restarts before giving up")
-	flags.Var(&opts.restartPolicy.window, flagRestartWindow, "Window used to evaluate the restart policy")
+	flags.Var(&opts.restartPolicy.window, flagRestartWindow, "Window used to evaluate the restart policy (ns|us|ms|s|m|h)")
 
 	flags.Uint64Var(&opts.update.parallelism, flagUpdateParallelism, 1, "Maximum number of tasks updated simultaneously (0 to update all at once)")
 	flags.DurationVar(&opts.update.delay, flagUpdateDelay, time.Duration(0), "Delay between updates (ns|us|ms|s|m|h) (default 0s)")
@@ -579,8 +568,8 @@ func addServiceFlags(cmd *cobra.Command, opts *serviceOptions) {
 	flags.Var(&opts.logDriver.opts, flagLogOpt, "Logging driver options")
 
 	flags.StringVar(&opts.healthcheck.cmd, flagHealthCmd, "", "Command to run to check health")
-	flags.Var(&opts.healthcheck.interval, flagHealthInterval, "Time between running the check")
-	flags.Var(&opts.healthcheck.timeout, flagHealthTimeout, "Maximum time to allow one check to run")
+	flags.Var(&opts.healthcheck.interval, flagHealthInterval, "Time between running the check (ns|us|ms|s|m|h)")
+	flags.Var(&opts.healthcheck.timeout, flagHealthTimeout, "Maximum time to allow one check to run (ns|us|ms|s|m|h)")
 	flags.IntVar(&opts.healthcheck.retries, flagHealthRetries, 0, "Consecutive failures needed to report unhealthy")
 	flags.BoolVar(&opts.healthcheck.noHealthcheck, flagNoHealthcheck, false, "Disable any container-specified HEALTHCHECK")
 
@@ -604,6 +593,9 @@ const (
 	flagDNSSearchRemove       = "dns-search-rm"
 	flagDNSSearchAdd          = "dns-search-add"
 	flagEndpointMode          = "endpoint-mode"
+	flagHost                  = "host"
+	flagHostAdd               = "host-add"
+	flagHostRemove            = "host-rm"
 	flagHostname              = "hostname"
 	flagEnv                   = "env"
 	flagEnvFile               = "env-file"

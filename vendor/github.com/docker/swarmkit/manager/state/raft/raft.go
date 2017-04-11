@@ -109,9 +109,10 @@ type Node struct {
 	// shutting down the node.
 	waitProp sync.WaitGroup
 
-	confState     raftpb.ConfState
-	appliedIndex  uint64
-	snapshotIndex uint64
+	confState       raftpb.ConfState
+	appliedIndex    uint64
+	snapshotMeta    raftpb.SnapshotMetadata
+	writtenWALIndex uint64
 
 	ticker clock.Ticker
 	doneCh chan struct{}
@@ -126,17 +127,18 @@ type Node struct {
 	// used for membership management checks
 	membershipLock sync.Mutex
 
-	snapshotInProgress chan uint64
+	snapshotInProgress chan raftpb.SnapshotMetadata
 	asyncTasks         sync.WaitGroup
 
 	// stopped chan is used for notifying grpc handlers that raft node going
 	// to stop.
 	stopped chan struct{}
 
-	lastSendToMember map[uint64]chan struct{}
-	raftLogger       *storage.EncryptedRaftLogger
-	keyRotator       EncryptionKeyRotator
-	rotationQueued   bool
+	lastSendToMember    map[uint64]chan struct{}
+	raftLogger          *storage.EncryptedRaftLogger
+	keyRotator          EncryptionKeyRotator
+	rotationQueued      bool
+	waitForAppliedIndex uint64
 }
 
 // NodeOptions provides node-level options.
@@ -268,7 +270,8 @@ func (n *Node) JoinAndStart(ctx context.Context) (err error) {
 
 	n.confState = snapshot.Metadata.ConfState
 	n.appliedIndex = snapshot.Metadata.Index
-	n.snapshotIndex = snapshot.Metadata.Index
+	n.snapshotMeta = snapshot.Metadata
+	n.writtenWALIndex, _ = n.raftStore.LastIndex() // lastIndex always returns nil as an error
 
 	if loadAndStartErr == storage.ErrNoWAL {
 		if n.opts.JoinAddr != "" {
@@ -406,7 +409,7 @@ func (n *Node) Run(ctx context.Context) error {
 
 			// Save entries to storage
 			if err := n.saveToStorage(ctx, &raftConfig, rd.HardState, rd.Entries, rd.Snapshot); err != nil {
-				log.G(ctx).WithError(err).Error("failed to save entries to storage")
+				return errors.Wrap(err, "failed to save entries to storage")
 			}
 
 			if len(rd.Messages) != 0 {
@@ -425,7 +428,7 @@ func (n *Node) Run(ctx context.Context) error {
 					log.G(ctx).WithError(err).Error("failed to restore from snapshot")
 				}
 				n.appliedIndex = rd.Snapshot.Metadata.Index
-				n.snapshotIndex = rd.Snapshot.Metadata.Index
+				n.snapshotMeta = rd.Snapshot.Metadata
 				n.confState = rd.Snapshot.Metadata.ConfState
 			}
 
@@ -471,10 +474,13 @@ func (n *Node) Run(ctx context.Context) error {
 				}
 			}
 
+			// in case the previous attempt to update the key failed
+			n.maybeMarkRotationFinished(ctx)
+
 			// Trigger a snapshot every once in awhile
 			if n.snapshotInProgress == nil &&
-				(n.keyRotator.NeedsRotation() || raftConfig.SnapshotInterval > 0 &&
-					n.appliedIndex-n.snapshotIndex >= raftConfig.SnapshotInterval) {
+				(n.needsSnapshot(ctx) || raftConfig.SnapshotInterval > 0 &&
+					n.appliedIndex-n.snapshotMeta.Index >= raftConfig.SnapshotInterval) {
 				n.doSnapshot(ctx, raftConfig)
 			}
 
@@ -499,24 +505,28 @@ func (n *Node) Run(ctx context.Context) error {
 					n.campaignWhenAble = false
 				}
 				if len(members) == 1 && members[n.Config.ID] != nil {
-					if err := n.raftNode.Campaign(ctx); err != nil {
-						panic("raft: cannot campaign to be the leader on node restore")
-					}
+					n.raftNode.Campaign(ctx)
 				}
 			}
 
-		case snapshotIndex := <-n.snapshotInProgress:
-			if snapshotIndex > n.snapshotIndex {
-				n.snapshotIndex = snapshotIndex
+		case snapshotMeta := <-n.snapshotInProgress:
+			raftConfig := n.getCurrentRaftConfig()
+			if snapshotMeta.Index > n.snapshotMeta.Index {
+				n.snapshotMeta = snapshotMeta
+				if err := n.raftLogger.GC(snapshotMeta.Index, snapshotMeta.Term, raftConfig.KeepOldSnapshots); err != nil {
+					log.G(ctx).WithError(err).Error("failed to clean up old snapshots and WALs")
+				}
 			}
 			n.snapshotInProgress = nil
-			if n.rotationQueued {
+			n.maybeMarkRotationFinished(ctx)
+			if n.rotationQueued && n.needsSnapshot(ctx) {
 				// there was a key rotation that took place before while the snapshot
 				// was in progress - we have to take another snapshot and encrypt with the new key
-				n.doSnapshot(ctx, n.getCurrentRaftConfig())
+				n.rotationQueued = false
+				n.doSnapshot(ctx, raftConfig)
 			}
 		case <-n.keyRotator.RotationNotify():
-			// There are 2 separate checks:  rotationQueued, and keyRotator.NeedsRotation().
+			// There are 2 separate checks:  rotationQueued, and n.needsSnapshot().
 			// We set rotationQueued so that when we are notified of a rotation, we try to
 			// do a snapshot as soon as possible.  However, if there is an error while doing
 			// the snapshot, we don't want to hammer the node attempting to do snapshots over
@@ -525,7 +535,7 @@ func (n *Node) Run(ctx context.Context) error {
 			switch {
 			case n.snapshotInProgress != nil:
 				n.rotationQueued = true
-			case n.keyRotator.NeedsRotation():
+			case n.needsSnapshot(ctx):
 				n.doSnapshot(ctx, n.getCurrentRaftConfig())
 			}
 		case <-n.removeRaftCh:
@@ -536,6 +546,52 @@ func (n *Node) Run(ctx context.Context) error {
 			return ErrMemberRemoved
 		case <-ctx.Done():
 			return nil
+		}
+	}
+}
+
+func (n *Node) needsSnapshot(ctx context.Context) bool {
+	if n.waitForAppliedIndex == 0 && n.keyRotator.NeedsRotation() {
+		keys := n.keyRotator.GetKeys()
+		if keys.PendingDEK != nil {
+			n.raftLogger.RotateEncryptionKey(keys.PendingDEK)
+			// we want to wait for the last index written with the old DEK to be commited, else a snapshot taken
+			// may have an index less than the index of a WAL written with an old DEK.  We want the next snapshot
+			// written with the new key to supercede any WAL written with an old DEK.
+			n.waitForAppliedIndex = n.writtenWALIndex
+			// if there is already a snapshot at this index or higher, bump the wait index up to 1 higher than the current
+			// snapshot index, because the rotation cannot be completed until the next snapshot
+			if n.waitForAppliedIndex <= n.snapshotMeta.Index {
+				n.waitForAppliedIndex = n.snapshotMeta.Index + 1
+			}
+			log.G(ctx).Debugf(
+				"beginning raft DEK rotation - last indices written with the old key are (snapshot: %d, WAL: %d) - waiting for snapshot of index %d to be written before rotation can be completed", n.snapshotMeta.Index, n.writtenWALIndex, n.waitForAppliedIndex)
+		}
+	}
+
+	result := n.waitForAppliedIndex > 0 && n.waitForAppliedIndex <= n.appliedIndex
+	if result {
+		log.G(ctx).Debugf(
+			"a snapshot at index %d is needed in order to complete raft DEK rotation - a snapshot with index >= %d can now be triggered",
+			n.waitForAppliedIndex, n.appliedIndex)
+	}
+	return result
+}
+
+func (n *Node) maybeMarkRotationFinished(ctx context.Context) {
+	if n.waitForAppliedIndex > 0 && n.waitForAppliedIndex <= n.snapshotMeta.Index {
+		// this means we tried to rotate - so finish the rotation
+		if err := n.keyRotator.UpdateKeys(EncryptionKeys{CurrentDEK: n.raftLogger.EncryptionKey}); err != nil {
+			log.G(ctx).WithError(err).Error("failed to update encryption keys after a successful rotation")
+		} else {
+			log.G(ctx).Debugf(
+				"a snapshot with index %d is available, which completes the DEK rotation requiring a snapshot of at least index %d - throwing away DEK and older snapshots encrypted with the old key",
+				n.snapshotMeta.Index, n.waitForAppliedIndex)
+			n.waitForAppliedIndex = 0
+
+			if err := n.raftLogger.GC(n.snapshotMeta.Index, n.snapshotMeta.Term, 0); err != nil {
+				log.G(ctx).WithError(err).Error("failed to remove old snapshots and WALs that were written with the previous raft DEK")
+			}
 		}
 	}
 }
@@ -656,11 +712,20 @@ func (n *Node) Join(ctx context.Context, req *api.JoinRequest) (*api.JoinRespons
 	defer n.membershipLock.Unlock()
 
 	if !n.IsMember() {
-		return nil, ErrNoRaftMember
+		return nil, grpc.Errorf(codes.FailedPrecondition, "%s", ErrNoRaftMember.Error())
 	}
 
 	if !n.isLeader() {
-		return nil, ErrLostLeadership
+		return nil, grpc.Errorf(codes.FailedPrecondition, "%s", ErrLostLeadership.Error())
+	}
+
+	// A single manager must not be able to join the raft cluster twice. If
+	// it did, that would cause the quorum to be computed incorrectly. This
+	// could happen if the WAL was deleted from an active manager.
+	for _, m := range n.cluster.Members() {
+		if m.NodeID == nodeInfo.NodeID {
+			return nil, grpc.Errorf(codes.AlreadyExists, "%s", "a raft member with this node ID already exists")
+		}
 	}
 
 	// Find a unique ID for the joining member.
@@ -680,7 +745,7 @@ func (n *Node) Join(ctx context.Context, req *api.JoinRequest) (*api.JoinRespons
 
 	requestHost, requestPort, err := net.SplitHostPort(remoteAddr)
 	if err != nil {
-		return nil, fmt.Errorf("invalid address %s in raft join request", remoteAddr)
+		return nil, grpc.Errorf(codes.InvalidArgument, "invalid address %s in raft join request", remoteAddr)
 	}
 
 	requestIP := net.ParseIP(requestHost)
@@ -859,18 +924,39 @@ func (n *Node) RemoveMember(ctx context.Context, id uint64) error {
 	return n.removeMember(ctx, id)
 }
 
+// processRaftMessageLogger is used to lazily create a logger for
+// ProcessRaftMessage. Usually nothing will be logged, so it is useful to avoid
+// formatting strings and allocating a logger when it won't be used.
+func (n *Node) processRaftMessageLogger(ctx context.Context, msg *api.ProcessRaftMessageRequest) *logrus.Entry {
+	fields := logrus.Fields{
+		"method": "(*Node).ProcessRaftMessage",
+	}
+
+	if n.IsMember() {
+		fields["raft_id"] = fmt.Sprintf("%x", n.Config.ID)
+	}
+
+	if msg != nil && msg.Message != nil {
+		fields["from"] = fmt.Sprintf("%x", msg.Message.From)
+	}
+
+	return log.G(ctx).WithFields(fields)
+}
+
 // ProcessRaftMessage calls 'Step' which advances the
 // raft state machine with the provided message on the
 // receiving node
 func (n *Node) ProcessRaftMessage(ctx context.Context, msg *api.ProcessRaftMessageRequest) (*api.ProcessRaftMessageResponse, error) {
 	if msg == nil || msg.Message == nil {
-		return nil, grpc.Errorf(codes.InvalidArgument, "no message provided")
+		n.processRaftMessageLogger(ctx, msg).Debug("received empty message")
+		return &api.ProcessRaftMessageResponse{}, nil
 	}
 
 	// Don't process the message if this comes from
 	// a node in the remove set
 	if n.cluster.IsIDRemoved(msg.Message.From) {
-		return nil, ErrMemberRemoved
+		n.processRaftMessageLogger(ctx, msg).Debug("received message from removed member")
+		return nil, grpc.Errorf(codes.NotFound, "%s", ErrMemberRemoved.Error())
 	}
 
 	var sourceHost string
@@ -888,37 +974,41 @@ func (n *Node) ProcessRaftMessage(ctx context.Context, msg *api.ProcessRaftMessa
 	if msg.Message.Type == raftpb.MsgVote {
 		member := n.cluster.GetMember(msg.Message.From)
 		if member == nil || member.Conn == nil {
-			log.G(ctx).Errorf("received vote request from unknown member %x", msg.Message.From)
-			return nil, ErrMemberUnknown
+			n.processRaftMessageLogger(ctx, msg).Debug("received message from unknown member")
+			return &api.ProcessRaftMessageResponse{}, nil
 		}
 
 		healthCtx, cancel := context.WithTimeout(ctx, time.Duration(n.Config.ElectionTick)*n.opts.TickInterval)
 		defer cancel()
 
 		if err := member.HealthCheck(healthCtx); err != nil {
-			log.G(ctx).WithError(err).Warningf("member %x which sent vote request failed health check", msg.Message.From)
-			return nil, errors.Wrap(err, "member unreachable")
+			n.processRaftMessageLogger(ctx, msg).WithError(err).Debug("member which sent vote request failed health check")
+			return &api.ProcessRaftMessageResponse{}, nil
 		}
 	}
 
 	if msg.Message.Type == raftpb.MsgProp {
-		// We don't accepted forwarded proposals. Our
+		// We don't accept forwarded proposals. Our
 		// current architecture depends on only the leader
 		// making proposals, so in-flight proposals can be
 		// guaranteed not to conflict.
-		return nil, grpc.Errorf(codes.InvalidArgument, "proposals not accepted")
+		n.processRaftMessageLogger(ctx, msg).Debug("dropped forwarded proposal")
+		return &api.ProcessRaftMessageResponse{}, nil
 	}
 
 	// can't stop the raft node while an async RPC is in progress
 	n.stopMu.RLock()
 	defer n.stopMu.RUnlock()
 
-	if !n.IsMember() {
-		return nil, ErrNoRaftMember
-	}
+	if n.IsMember() {
+		if msg.Message.To != n.Config.ID {
+			n.processRaftMessageLogger(ctx, msg).Errorf("received message intended for raft_id %x", msg.Message.To)
+			return &api.ProcessRaftMessageResponse{}, nil
+		}
 
-	if err := n.raftNode.Step(ctx, *msg.Message); err != nil {
-		return nil, err
+		if err := n.raftNode.Step(ctx, *msg.Message); err != nil {
+			n.processRaftMessageLogger(ctx, msg).WithError(err).Debug("raft Step failed")
+		}
 	}
 
 	return &api.ProcessRaftMessageResponse{}, nil
@@ -1190,6 +1280,13 @@ func (n *Node) saveToStorage(
 		return ErrApplySnapshot
 	}
 
+	if len(entries) > 0 {
+		lastIndex := entries[len(entries)-1].Index
+		if lastIndex > n.writtenWALIndex {
+			n.writtenWALIndex = lastIndex
+		}
+	}
+
 	if err = n.raftStore.Append(entries); err != nil {
 		return ErrAppendEntry
 	}
@@ -1236,25 +1333,32 @@ func (n *Node) sendToMember(ctx context.Context, members map[uint64]*membership.
 	defer n.asyncTasks.Done()
 	defer close(thisSend)
 
-	ctx, cancel := context.WithTimeout(ctx, n.opts.SendTimeout)
-	defer cancel()
-
 	if lastSend != nil {
+		waitCtx, waitCancel := context.WithTimeout(ctx, n.opts.SendTimeout)
+		defer waitCancel()
+
 		select {
 		case <-lastSend:
-		case <-ctx.Done():
+		case <-waitCtx.Done():
 			return
 		}
+
+		select {
+		case <-waitCtx.Done():
+			return
+		default:
+		}
 	}
+
+	ctx, cancel := context.WithTimeout(ctx, n.opts.SendTimeout)
+	defer cancel()
 
 	if n.cluster.IsIDRemoved(m.To) {
 		// Should not send to removed members
 		return
 	}
 
-	var (
-		conn *membership.Member
-	)
+	var conn *membership.Member
 	if toMember, ok := members[m.To]; ok {
 		conn = toMember
 	} else {
@@ -1297,7 +1401,7 @@ func (n *Node) sendToMember(ctx context.Context, members map[uint64]*membership.
 
 	_, err := api.NewRaftClient(conn.Conn).ProcessRaftMessage(ctx, &api.ProcessRaftMessageRequest{Message: &m})
 	if err != nil {
-		if grpc.ErrorDesc(err) == ErrMemberRemoved.Error() {
+		if grpc.Code(err) == codes.NotFound && grpc.ErrorDesc(err) == ErrMemberRemoved.Error() {
 			n.removeRaftFunc()
 		}
 		if m.Type == raftpb.MsgSnap {
@@ -1315,11 +1419,15 @@ func (n *Node) sendToMember(ctx context.Context, members map[uint64]*membership.
 			officialHost, officialPort, _ := net.SplitHostPort(conn.Addr)
 			if officialHost != lastSeenHost {
 				reconnectAddr := net.JoinHostPort(lastSeenHost, officialPort)
-				log.G(ctx).Warningf("detected address change for %x (%s -> %s)", m.To, conn.Addr, reconnectAddr)
-				if err := n.handleAddressChange(ctx, conn, reconnectAddr); err != nil {
-					log.G(ctx).WithError(err).Error("failed to hande address change")
-				}
-				return
+				log.G(ctx).Debugf("detected address change for %x (%s -> %s)", m.To, conn.Addr, reconnectAddr)
+				// TODO(aaronl): Address changes are temporarily disabled.
+				// See https://github.com/docker/docker/issues/30455.
+				// This should be reenabled in the future with additional
+				// safeguards (perhaps storing multiple addresses per node).
+				//if err := n.handleAddressChange(ctx, conn, reconnectAddr); err != nil {
+				//	log.G(ctx).WithError(err).Error("failed to hande address change")
+				//}
+				//return
 			}
 		}
 
@@ -1715,10 +1823,10 @@ func createConfigChangeEnts(ids []uint64, self uint64, term, index uint64) []raf
 // - ConfChangeAddNode, in which case the contained ID will be added into the set.
 // - ConfChangeRemoveNode, in which case the contained ID will be removed from the set.
 func getIDs(snap *raftpb.Snapshot, ents []raftpb.Entry) []uint64 {
-	ids := make(map[uint64]bool)
+	ids := make(map[uint64]struct{})
 	if snap != nil {
 		for _, id := range snap.Metadata.ConfState.Nodes {
-			ids[id] = true
+			ids[id] = struct{}{}
 		}
 	}
 	for _, e := range ents {
@@ -1734,7 +1842,7 @@ func getIDs(snap *raftpb.Snapshot, ents []raftpb.Entry) []uint64 {
 		}
 		switch cc.Type {
 		case raftpb.ConfChangeAddNode:
-			ids[cc.NodeID] = true
+			ids[cc.NodeID] = struct{}{}
 		case raftpb.ConfChangeRemoveNode:
 			delete(ids, cc.NodeID)
 		case raftpb.ConfChangeUpdateNode:

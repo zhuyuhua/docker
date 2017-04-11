@@ -73,7 +73,7 @@ type networkContext struct {
 }
 
 func (a *Allocator) doNetworkInit(ctx context.Context) (err error) {
-	na, err := networkallocator.New()
+	na, err := networkallocator.New(a.pluginGetter)
 	if err != nil {
 		return err
 	}
@@ -289,8 +289,9 @@ func (a *Allocator) doNetworkInit(ctx context.Context) (err error) {
 			if a.taskAllocateVote(networkVoter, t.ID) {
 				// If the task is not attached to any network, network
 				// allocators job is done. Immediately cast a vote so
-				// that the task can be moved to ALLOCATED state as
+				// that the task can be moved to the PENDING state as
 				// soon as possible.
+				updateTaskStatus(t, api.TaskStatePending, allocatedStatusMessage)
 				allocatedTasks = append(allocatedTasks, t)
 			}
 			continue
@@ -371,12 +372,15 @@ func (a *Allocator) doNetworkAlloc(ctx context.Context, ev events.Event) {
 		s := v.Service.Copy()
 
 		if nc.nwkAllocator.IsServiceAllocated(s) {
-			break
-		}
-
-		if err := a.allocateService(ctx, s); err != nil {
-			log.G(ctx).WithError(err).Errorf("Failed allocation during update of service %s", s.ID)
-			break
+			if nc.nwkAllocator.PortsAllocatedInHostPublishMode(s) {
+				break
+			}
+			updatePortsInHostPublishMode(s)
+		} else {
+			if err := a.allocateService(ctx, s); err != nil {
+				log.G(ctx).WithError(err).Errorf("Failed allocation during update of service %s", s.ID)
+				break
+			}
 		}
 
 		if _, err := a.store.Batch(func(batch *store.Batch) error {
@@ -464,7 +468,7 @@ func taskDead(t *api.Task) bool {
 }
 
 // taskReadyForNetworkVote checks if the task is ready for a network
-// vote to move it to ALLOCATED state.
+// vote to move it to PENDING state.
 func taskReadyForNetworkVote(t *api.Task, s *api.Service, nc *networkContext) bool {
 	// Task is ready for vote if the following is true:
 	//
@@ -639,6 +643,36 @@ func (a *Allocator) commitAllocatedNode(ctx context.Context, batch *store.Batch,
 	}
 
 	return nil
+}
+
+// This function prepares the service object for being updated when the change regards
+// the published ports in host mode: It resets the runtime state ports (s.Endpoint.Ports)
+// to the current ingress mode runtime state ports plus the newly configured publish mode ports,
+// so that the service allocation invoked on this new service object will trigger the deallocation
+// of any old publish mode port and allocation of any new one.
+func updatePortsInHostPublishMode(s *api.Service) {
+	if s.Endpoint != nil {
+		var portConfigs []*api.PortConfig
+		for _, portConfig := range s.Endpoint.Ports {
+			if portConfig.PublishMode == api.PublishModeIngress {
+				portConfigs = append(portConfigs, portConfig)
+			}
+		}
+		s.Endpoint.Ports = portConfigs
+	}
+
+	if s.Spec.Endpoint != nil {
+		if s.Endpoint == nil {
+			s.Endpoint = &api.Endpoint{}
+		}
+		for _, portConfig := range s.Spec.Endpoint.Ports {
+			if portConfig.PublishMode == api.PublishModeIngress {
+				continue
+			}
+			s.Endpoint.Ports = append(s.Endpoint.Ports, portConfig.Copy())
+		}
+		s.Endpoint.Spec = s.Spec.Endpoint.Copy()
+	}
 }
 
 func (a *Allocator) allocateService(ctx context.Context, s *api.Service) error {

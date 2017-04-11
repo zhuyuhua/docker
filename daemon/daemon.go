@@ -8,7 +8,6 @@ package daemon
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"net"
 	"os"
@@ -17,7 +16,6 @@ import (
 	"runtime"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/Sirupsen/logrus"
@@ -28,7 +26,9 @@ import (
 	"github.com/docker/docker/container"
 	"github.com/docker/docker/daemon/events"
 	"github.com/docker/docker/daemon/exec"
+	"github.com/docker/docker/daemon/initlayer"
 	"github.com/docker/docker/dockerversion"
+	"github.com/docker/docker/plugin"
 	"github.com/docker/libnetwork/cluster"
 	// register graph drivers
 	_ "github.com/docker/docker/daemon/graphdriver/register"
@@ -39,17 +39,13 @@ import (
 	"github.com/docker/docker/libcontainerd"
 	"github.com/docker/docker/migrate/v1"
 	"github.com/docker/docker/pkg/fileutils"
-	"github.com/docker/docker/pkg/graphdb"
 	"github.com/docker/docker/pkg/idtools"
 	"github.com/docker/docker/pkg/plugingetter"
-	"github.com/docker/docker/pkg/progress"
 	"github.com/docker/docker/pkg/registrar"
 	"github.com/docker/docker/pkg/signal"
-	"github.com/docker/docker/pkg/streamformatter"
 	"github.com/docker/docker/pkg/sysinfo"
 	"github.com/docker/docker/pkg/system"
 	"github.com/docker/docker/pkg/truncindex"
-	pluginstore "github.com/docker/docker/plugin/store"
 	"github.com/docker/docker/reference"
 	"github.com/docker/docker/registry"
 	"github.com/docker/docker/runconfig"
@@ -59,12 +55,16 @@ import (
 	"github.com/docker/libnetwork"
 	nwconfig "github.com/docker/libnetwork/config"
 	"github.com/docker/libtrust"
+	"github.com/pkg/errors"
 )
 
 var (
 	// DefaultRuntimeBinary is the default runtime to be used by
 	// containerd if none is specified
 	DefaultRuntimeBinary = "docker-runc"
+
+	// DefaultInitBinary is the name of the default init binary
+	DefaultInitBinary = "docker-init"
 
 	errSystemNotSupported = fmt.Errorf("The Docker daemon is not supported on this platform.")
 )
@@ -96,7 +96,8 @@ type Daemon struct {
 	gidMaps                   []idtools.IDMap
 	layerStore                layer.Store
 	imageStore                image.Store
-	PluginStore               *pluginstore.Store
+	PluginStore               *plugin.Store // todo: remove
+	pluginManager             *plugin.Manager
 	nameIndex                 *registrar.Registrar
 	linkIndex                 *linkIndex
 	containerd                libcontainerd.Client
@@ -154,7 +155,6 @@ func (daemon *Daemon) restore() error {
 		}
 	}
 
-	var migrateLegacyLinks bool
 	removeContainers := make(map[string]*container.Container)
 	restartContainers := make(map[*container.Container]chan struct{})
 	activeSandboxes := make(map[string]interface{})
@@ -186,6 +186,8 @@ func (daemon *Daemon) restore() error {
 			}
 		}
 	}
+
+	var migrateLegacyLinks bool // Not relevant on Windows
 	var wg sync.WaitGroup
 	var mapLock sync.Mutex
 	for _, c := range containers {
@@ -202,6 +204,23 @@ func (daemon *Daemon) restore() error {
 					logrus.Errorf("Failed to restore %s with containerd: %s", c.ID, err)
 					return
 				}
+
+				// we call Mount and then Unmount to get BaseFs of the container
+				if err := daemon.Mount(c); err != nil {
+					// The mount is unlikely to fail. However, in case mount fails
+					// the container should be allowed to restore here. Some functionalities
+					// (like docker exec -u user) might be missing but container is able to be
+					// stopped/restarted/removed.
+					// See #29365 for related information.
+					// The error is only logged here.
+					logrus.Warnf("Failed to mount container on getting BaseFs path %v: %v", c.ID, err)
+				} else {
+					// if mount success, then unmount it
+					if err := daemon.Unmount(c); err != nil {
+						logrus.Warnf("Failed to umount container on getting BaseFs path %v: %v", c.ID, err)
+					}
+				}
+
 				c.ResetRestartManager(false)
 				if !c.HostConfig.NetworkMode.IsContainer() && c.IsRunning() {
 					options, err := daemon.buildSandboxOptions(c)
@@ -261,24 +280,15 @@ func (daemon *Daemon) restore() error {
 		return fmt.Errorf("Error initializing network controller: %v", err)
 	}
 
-	// migrate any legacy links from sqlite
-	linkdbFile := filepath.Join(daemon.root, "linkgraph.db")
-	var legacyLinkDB *graphdb.Database
+	// Perform migration of legacy sqlite links (no-op on Windows)
 	if migrateLegacyLinks {
-		legacyLinkDB, err = graphdb.NewSqliteConn(linkdbFile)
-		if err != nil {
-			return fmt.Errorf("error connecting to legacy link graph DB %s, container links may be lost: %v", linkdbFile, err)
+		if err := daemon.sqliteMigration(containers); err != nil {
+			return err
 		}
-		defer legacyLinkDB.Close()
 	}
 
 	// Now that all the containers are registered, register the links
 	for _, c := range containers {
-		if migrateLegacyLinks {
-			if err := daemon.migrateLegacySqliteLinks(legacyLinkDB, c); err != nil {
-				return err
-			}
-		}
 		if err := daemon.registerLinks(c, c.HostConfig); err != nil {
 			logrus.Errorf("failed to register link for container %s: %v", c.ID, err)
 		}
@@ -436,10 +446,26 @@ func (daemon *Daemon) registerLink(parent, child *container.Container, alias str
 	return nil
 }
 
-// SetClusterProvider sets a component for querying the current cluster state.
-func (daemon *Daemon) SetClusterProvider(clusterProvider cluster.Provider) {
+// DaemonJoinsCluster informs the daemon has joined the cluster and provides
+// the handler to query the cluster component
+func (daemon *Daemon) DaemonJoinsCluster(clusterProvider cluster.Provider) {
+	daemon.setClusterProvider(clusterProvider)
+}
+
+// DaemonLeavesCluster informs the daemon has left the cluster
+func (daemon *Daemon) DaemonLeavesCluster() {
+	// Daemon is in charge of removing the attachable networks with
+	// connected containers when the node leaves the swarm
+	daemon.clearAttachableNetworks()
+	daemon.setClusterProvider(nil)
+}
+
+// setClusterProvider sets a component for querying the current cluster state.
+func (daemon *Daemon) setClusterProvider(clusterProvider cluster.Provider) {
 	daemon.clusterProvider = clusterProvider
-	daemon.netController.SetClusterProvider(clusterProvider)
+	// call this in a goroutine to allow netcontroller handle this event async
+	// and not block if it is in the middle of talking with cluster
+	go daemon.netController.SetClusterProvider(clusterProvider)
 }
 
 // IsSwarmCompatible verifies if the current daemon
@@ -488,21 +514,6 @@ func NewDaemon(config *Config, registryService registry.Service, containerdRemot
 		return nil, err
 	}
 
-	// get the canonical path to the Docker root directory
-	var realRoot string
-	if _, err := os.Stat(config.Root); err != nil && os.IsNotExist(err) {
-		realRoot = config.Root
-	} else {
-		realRoot, err = fileutils.ReadSymlinkedDirectory(config.Root)
-		if err != nil {
-			return nil, fmt.Errorf("Unable to get the full path to root (%s): %s", config.Root, err)
-		}
-	}
-
-	if err := setupDaemonRoot(config, realRoot, rootUID, rootGID); err != nil {
-		return nil, err
-	}
-
 	if err := setupDaemonProcess(config); err != nil {
 		return nil, err
 	}
@@ -544,14 +555,17 @@ func NewDaemon(config *Config, registryService registry.Service, containerdRemot
 		logrus.Warnf("Failed to configure golang's threads limit: %v", err)
 	}
 
-	installDefaultAppArmorProfile()
+	if err := ensureDefaultAppArmorProfile(); err != nil {
+		logrus.Errorf(err.Error())
+	}
+
 	daemonRepo := filepath.Join(config.Root, "containers")
 	if err := idtools.MkdirAllAs(daemonRepo, 0700, rootUID, rootGID); err != nil && !os.IsExist(err) {
 		return nil, err
 	}
 
 	if runtime.GOOS == "windows" {
-		if err := idtools.MkdirAllAs(filepath.Join(config.Root, "credentialspecs"), 0700, rootUID, rootGID); err != nil && !os.IsExist(err) {
+		if err := system.MkdirAll(filepath.Join(config.Root, "credentialspecs"), 0); err != nil && !os.IsExist(err) {
 			return nil, err
 		}
 	}
@@ -561,7 +575,21 @@ func NewDaemon(config *Config, registryService registry.Service, containerdRemot
 		driverName = config.GraphDriver
 	}
 
-	d.PluginStore = pluginstore.NewStore(config.Root)
+	d.RegistryService = registryService
+	d.PluginStore = plugin.NewStore(config.Root) // todo: remove
+	// Plugin system initialization should happen before restore. Do not change order.
+	d.pluginManager, err = plugin.NewManager(plugin.ManagerConfig{
+		Root:               filepath.Join(config.Root, "plugins"),
+		ExecRoot:           "/run/docker/plugins", // possibly needs fixing
+		Store:              d.PluginStore,
+		Executor:           containerdRemote,
+		RegistryService:    registryService,
+		LiveRestoreEnabled: config.LiveRestoreEnabled,
+		LogPluginEvent:     d.LogPluginEvent, // todo: make private
+	})
+	if err != nil {
+		return nil, errors.Wrap(err, "couldn't create plugin manager")
+	}
 
 	d.layerStore, err = layer.NewStoreFromOptions(layer.StoreOptions{
 		StorePath:                 config.Root,
@@ -571,6 +599,7 @@ func NewDaemon(config *Config, registryService registry.Service, containerdRemot
 		UIDMaps:                   uidMaps,
 		GIDMaps:                   gidMaps,
 		PluginGetter:              d.PluginStore,
+		ExperimentalEnabled:       config.Experimental,
 	})
 	if err != nil {
 		return nil, err
@@ -660,7 +689,6 @@ func NewDaemon(config *Config, registryService registry.Service, containerdRemot
 		Type:   config.LogConfig.Type,
 		Config: config.LogConfig.Config,
 	}
-	d.RegistryService = registryService
 	d.EventsService = eventsService
 	d.volumes = volStore
 	d.root = config.Root
@@ -676,11 +704,6 @@ func NewDaemon(config *Config, registryService registry.Service, containerdRemot
 
 	d.containerd, err = containerdRemote.Client(d)
 	if err != nil {
-		return nil, err
-	}
-
-	// Plugin system initialization should happen before restore. Do not change order.
-	if err := d.pluginInit(config, containerdRemote); err != nil {
 		return nil, err
 	}
 
@@ -704,7 +727,11 @@ func NewDaemon(config *Config, registryService registry.Service, containerdRemot
 
 	// set up SIGUSR1 handler on Unix-like systems, or a Win32 global event
 	// on Windows to dump Go routine stacks
-	d.setupDumpStackTrap(config.Root)
+	stackDumpDir := config.Root
+	if execRoot := config.GetExecRoot(); execRoot != "" {
+		stackDumpDir = execRoot
+	}
+	d.setupDumpStackTrap(stackDumpDir)
 
 	return d, nil
 }
@@ -804,18 +831,24 @@ func (daemon *Daemon) Shutdown() error {
 		})
 	}
 
-	// Shutdown plugins after containers. Dont change the order.
-	daemon.pluginShutdown()
-
-	// trigger libnetwork Stop only if it's initialized
-	if daemon.netController != nil {
-		daemon.netController.Stop()
+	if daemon.volumes != nil {
+		if err := daemon.volumes.Shutdown(); err != nil {
+			logrus.Errorf("Error shutting down volume store: %v", err)
+		}
 	}
 
 	if daemon.layerStore != nil {
 		if err := daemon.layerStore.Cleanup(); err != nil {
 			logrus.Errorf("Error during layer Store.Cleanup(): %v", err)
 		}
+	}
+
+	// Shutdown plugins after containers and layerstore. Don't change the order.
+	daemon.pluginShutdown()
+
+	// trigger libnetwork Stop only if it's initialized
+	if daemon.netController != nil {
+		daemon.netController.Stop()
 	}
 
 	if err := daemon.cleanupMounts(); err != nil {
@@ -894,36 +927,6 @@ func (daemon *Daemon) V6Subnets() []net.IPNet {
 	return subnets
 }
 
-func writeDistributionProgress(cancelFunc func(), outStream io.Writer, progressChan <-chan progress.Progress) {
-	progressOutput := streamformatter.NewJSONStreamFormatter().NewProgressOutput(outStream, false)
-	operationCancelled := false
-
-	for prog := range progressChan {
-		if err := progressOutput.WriteProgress(prog); err != nil && !operationCancelled {
-			// don't log broken pipe errors as this is the normal case when a client aborts
-			if isBrokenPipe(err) {
-				logrus.Info("Pull session cancelled")
-			} else {
-				logrus.Errorf("error writing progress to client: %v", err)
-			}
-			cancelFunc()
-			operationCancelled = true
-			// Don't return, because we need to continue draining
-			// progressChan until it's closed to avoid a deadlock.
-		}
-	}
-}
-
-func isBrokenPipe(e error) bool {
-	if netErr, ok := e.(*net.OpError); ok {
-		e = netErr.Err
-		if sysErr, ok := netErr.Err.(*os.SyscallError); ok {
-			e = sysErr.Err
-		}
-	}
-	return e == syscall.EPIPE
-}
-
 // GraphDriverName returns the name of the graph driver used by the layer.Store
 func (daemon *Daemon) GraphDriverName() string {
 	return daemon.layerStore.DriverName()
@@ -955,7 +958,7 @@ func tempDir(rootDir string, rootUID, rootGID int) (string, error) {
 
 func (daemon *Daemon) setupInitLayer(initPath string) error {
 	rootUID, rootGID := daemon.GetRemappedUIDGID()
-	return setupInitLayer(initPath, rootUID, rootGID)
+	return initlayer.Setup(initPath, rootUID, rootGID)
 }
 
 func setDefaultMtu(config *Config) {
@@ -1203,6 +1206,7 @@ func (daemon *Daemon) networkOptions(dconfig *Config, pg plugingetter.PluginGett
 		return options, nil
 	}
 
+	options = append(options, nwconfig.OptionExperimental(dconfig.Experimental))
 	options = append(options, nwconfig.OptionDataDir(dconfig.Root))
 	options = append(options, nwconfig.OptionExecRoot(dconfig.GetExecRoot()))
 
@@ -1266,4 +1270,52 @@ func (daemon *Daemon) GetCluster() Cluster {
 // SetCluster sets the cluster
 func (daemon *Daemon) SetCluster(cluster Cluster) {
 	daemon.cluster = cluster
+}
+
+func (daemon *Daemon) pluginShutdown() {
+	manager := daemon.pluginManager
+	// Check for a valid manager object. In error conditions, daemon init can fail
+	// and shutdown called, before plugin manager is initialized.
+	if manager != nil {
+		manager.Shutdown()
+	}
+}
+
+// PluginManager returns current pluginManager associated with the daemon
+func (daemon *Daemon) PluginManager() *plugin.Manager { // set up before daemon to avoid this method
+	return daemon.pluginManager
+}
+
+// PluginGetter returns current pluginStore associated with the daemon
+func (daemon *Daemon) PluginGetter() *plugin.Store {
+	return daemon.PluginStore
+}
+
+// CreateDaemonRoot creates the root for the daemon
+func CreateDaemonRoot(config *Config) error {
+	// get the canonical path to the Docker root directory
+	var realRoot string
+	if _, err := os.Stat(config.Root); err != nil && os.IsNotExist(err) {
+		realRoot = config.Root
+	} else {
+		realRoot, err = fileutils.ReadSymlinkedDirectory(config.Root)
+		if err != nil {
+			return fmt.Errorf("Unable to get the full path to root (%s): %s", config.Root, err)
+		}
+	}
+
+	uidMaps, gidMaps, err := setupRemappedRoot(config)
+	if err != nil {
+		return err
+	}
+	rootUID, rootGID, err := idtools.GetRootUIDGID(uidMaps, gidMaps)
+	if err != nil {
+		return err
+	}
+
+	if err := setupDaemonRoot(config, realRoot, rootUID, rootGID); err != nil {
+		return err
+	}
+
+	return nil
 }

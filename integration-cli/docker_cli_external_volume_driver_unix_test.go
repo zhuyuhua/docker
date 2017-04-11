@@ -73,6 +73,7 @@ type vol struct {
 	Mountpoint string
 	Ninja      bool // hack used to trigger a null volume return on `Get`
 	Status     map[string]interface{}
+	Options    map[string]string
 }
 
 func (p *volumePlugin) Close() {
@@ -130,7 +131,7 @@ func newVolumePlugin(c *check.C, name string) *volumePlugin {
 		}
 		_, isNinja := pr.Opts["ninja"]
 		status := map[string]interface{}{"Hello": "world"}
-		s.vols[pr.Name] = vol{Name: pr.Name, Ninja: isNinja, Status: status}
+		s.vols[pr.Name] = vol{Name: pr.Name, Ninja: isNinja, Status: status, Options: pr.Opts}
 		send(w, nil)
 	})
 
@@ -212,6 +213,14 @@ func newVolumePlugin(c *check.C, name string) *volumePlugin {
 			return
 		}
 
+		if v, exists := s.vols[pr.Name]; exists {
+			// Use this to simulate a mount failure
+			if _, exists := v.Options["invalidOption"]; exists {
+				send(w, fmt.Errorf("invalid argument"))
+				return
+			}
+		}
+
 		p := hostVolumePath(pr.Name)
 		if err := os.MkdirAll(p, 0755); err != nil {
 			send(w, &pluginResp{Err: err.Error()})
@@ -268,6 +277,22 @@ func (s *DockerExternalVolumeSuite) TearDownSuite(c *check.C) {
 
 	err := os.RemoveAll("/etc/docker/plugins")
 	c.Assert(err, checker.IsNil)
+}
+
+func (s *DockerExternalVolumeSuite) TestVolumeCLICreateOptionConflict(c *check.C) {
+	dockerCmd(c, "volume", "create", "test")
+
+	out, _, err := dockerCmdWithError("volume", "create", "test", "--driver", volumePluginName)
+	c.Assert(err, check.NotNil, check.Commentf("volume create exception name already in use with another driver"))
+	c.Assert(out, checker.Contains, "A volume named test already exists")
+
+	out, _ = dockerCmd(c, "volume", "inspect", "--format={{ .Driver }}", "test")
+	_, _, err = dockerCmdWithError("volume", "create", "test", "--driver", strings.TrimSpace(out))
+	c.Assert(err, check.IsNil)
+
+	// make sure hidden --name option conflicts with positional arg name
+	out, _, err = dockerCmdWithError("volume", "create", "--name", "test2", "test2")
+	c.Assert(err, check.NotNil, check.Commentf("Conflicting options: either specify --name or provide positional arg, not both"))
 }
 
 func (s *DockerExternalVolumeSuite) TestExternalVolumeDriverNamed(c *check.C) {
@@ -559,6 +584,44 @@ func (s *DockerExternalVolumeSuite) TestExternalVolumeDriverOutOfBandDelete(c *c
 	// simulate out of band volume deletion on plugin level
 	delete(p.vols, "test")
 
+	// test re-create with same driver
+	out, err = s.d.Cmd("volume", "create", "-d", driverName, "--opt", "foo=bar", "--name", "test")
+	c.Assert(err, checker.IsNil, check.Commentf(out))
+	out, err = s.d.Cmd("volume", "inspect", "test")
+	c.Assert(err, checker.IsNil, check.Commentf(out))
+
+	var vs []types.Volume
+	err = json.Unmarshal([]byte(out), &vs)
+	c.Assert(err, checker.IsNil)
+	c.Assert(vs, checker.HasLen, 1)
+	c.Assert(vs[0].Driver, checker.Equals, driverName)
+	c.Assert(vs[0].Options, checker.NotNil)
+	c.Assert(vs[0].Options["foo"], checker.Equals, "bar")
+	c.Assert(vs[0].Driver, checker.Equals, driverName)
+
+	// simulate out of band volume deletion on plugin level
+	delete(p.vols, "test")
+
+	// test create with different driver
 	out, err = s.d.Cmd("volume", "create", "-d", "local", "--name", "test")
 	c.Assert(err, checker.IsNil, check.Commentf(out))
+
+	out, err = s.d.Cmd("volume", "inspect", "test")
+	c.Assert(err, checker.IsNil, check.Commentf(out))
+	vs = nil
+	err = json.Unmarshal([]byte(out), &vs)
+	c.Assert(err, checker.IsNil)
+	c.Assert(vs, checker.HasLen, 1)
+	c.Assert(vs[0].Options, checker.HasLen, 0)
+	c.Assert(vs[0].Driver, checker.Equals, "local")
+}
+
+func (s *DockerExternalVolumeSuite) TestExternalVolumeDriverUnmountOnMountFail(c *check.C) {
+	c.Assert(s.d.StartWithBusybox(), checker.IsNil)
+	s.d.Cmd("volume", "create", "-d", "test-external-volume-driver", "--opt=invalidOption=1", "--name=testumount")
+
+	out, _ := s.d.Cmd("run", "-v", "testumount:/foo", "busybox", "true")
+	c.Assert(s.ec.unmounts, checker.Equals, 0, check.Commentf(out))
+	out, _ = s.d.Cmd("run", "-w", "/foo", "-v", "testumount:/foo", "busybox", "true")
+	c.Assert(s.ec.unmounts, checker.Equals, 0, check.Commentf(out))
 }

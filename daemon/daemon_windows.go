@@ -19,10 +19,12 @@ import (
 	"github.com/docker/docker/runconfig"
 	"github.com/docker/libnetwork"
 	nwconfig "github.com/docker/libnetwork/config"
+	"github.com/docker/libnetwork/datastore"
 	winlibnetwork "github.com/docker/libnetwork/drivers/windows"
 	"github.com/docker/libnetwork/netlabel"
 	"github.com/docker/libnetwork/options"
 	blkiodev "github.com/opencontainers/runc/libcontainer/configs"
+	"golang.org/x/sys/windows"
 )
 
 const (
@@ -57,10 +59,6 @@ func getBlkioReadBpsDevices(config *containertypes.HostConfig) ([]blkiodev.Throt
 
 func getBlkioWriteBpsDevices(config *containertypes.HostConfig) ([]blkiodev.ThrottleDevice, error) {
 	return nil, nil
-}
-
-func setupInitLayer(initLayer string, rootUID, rootGID int) error {
-	return nil
 }
 
 func (daemon *Daemon) getLayerInit() func(string) error {
@@ -128,8 +126,10 @@ func verifyContainerResources(resources *containertypes.Resources, isHyperv bool
 	if resources.NanoCPUs > 0 && resources.CPUShares > 0 {
 		return warnings, fmt.Errorf("conflicting options: Nano CPUs and CPU Shares cannot both be set")
 	}
+	// The precision we could get is 0.01, because on Windows we have to convert to CPUPercent.
+	// We don't set the lower limit here and it is up to the underlying platform (e.g., Windows) to return an error.
 	if resources.NanoCPUs < 0 || resources.NanoCPUs > int64(sysinfo.NumCPU())*1e9 {
-		return warnings, fmt.Errorf("range of Nano CPUs is from 1 to %d", int64(sysinfo.NumCPU())*1e9)
+		return warnings, fmt.Errorf("range of CPUs is from 0.01 to %d.00, as there are only %d CPUs available", sysinfo.NumCPU(), sysinfo.NumCPU())
 	}
 
 	if len(resources.BlkioDeviceReadBps) > 0 {
@@ -191,12 +191,18 @@ func verifyContainerResources(resources *containertypes.Resources, isHyperv bool
 func verifyPlatformContainerSettings(daemon *Daemon, hostConfig *containertypes.HostConfig, config *containertypes.Config, update bool) ([]string, error) {
 	warnings := []string{}
 
-	w, err := verifyContainerResources(&hostConfig.Resources, daemon.runAsHyperVContainer(hostConfig))
+	hyperv := daemon.runAsHyperVContainer(hostConfig)
+	if !hyperv && system.IsWindowsClient() {
+		// @engine maintainers. This block should not be removed. It partially enforces licensing
+		// restrictions on Windows. Ping @jhowardmsft if there are concerns or PRs to change this.
+		return warnings, fmt.Errorf("Windows client operating systems only support Hyper-V containers")
+	}
+
+	w, err := verifyContainerResources(&hostConfig.Resources, hyperv)
 	warnings = append(warnings, w...)
 	if err != nil {
 		return warnings, err
 	}
-
 	return warnings, nil
 }
 
@@ -220,6 +226,11 @@ func checkSystem() error {
 	}
 	if osv.Build < 14393 {
 		return fmt.Errorf("The docker daemon requires build 14393 or later of Windows Server 2016 or Windows 10")
+	}
+
+	vmcompute := windows.NewLazySystemDLL("vmcompute.dll")
+	if vmcompute.Load() != nil {
+		return fmt.Errorf("Failed to load vmcompute.dll. Ensure that the Containers role is installed.")
 	}
 	return nil
 }
@@ -263,9 +274,12 @@ func (daemon *Daemon) initNetworkController(config *Config, activeSandboxes map[
 		}
 
 		if !found {
-			err = v.Delete()
-			if err != nil {
-				return nil, err
+			// global networks should not be deleted by local HNS
+			if v.Info().Scope() != datastore.GlobalScope {
+				err = v.Delete()
+				if err != nil {
+					logrus.Errorf("Error occurred when removing network %v", err)
+				}
 			}
 		}
 	}
@@ -302,6 +316,10 @@ func (daemon *Daemon) initNetworkController(config *Config, activeSandboxes map[
 
 		controller.WalkNetworks(s)
 		if n != nil {
+			// global networks should not be deleted by local HNS
+			if n.Info().Scope() == datastore.GlobalScope {
+				continue
+			}
 			v.Name = n.Name()
 			// This will not cause network delete from HNS as the network
 			// is not yet populated in the libnetwork windows driver
@@ -418,7 +436,7 @@ func setupRemappedRoot(config *Config) ([]idtools.IDMap, []idtools.IDMap, error)
 func setupDaemonRoot(config *Config, rootDir string, rootUID, rootGID int) error {
 	config.Root = rootDir
 	// Create the root directory if it doesn't exists
-	if err := system.MkdirAll(config.Root, 0700); err != nil && !os.IsExist(err) {
+	if err := system.MkdirAllWithACL(config.Root, 0); err != nil && !os.IsExist(err) {
 		return err
 	}
 	return nil

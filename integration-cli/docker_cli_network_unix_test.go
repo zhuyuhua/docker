@@ -712,7 +712,7 @@ func (s *DockerNetworkSuite) TestDockerNetworkInspectCustomUnspecified(c *check.
 }
 
 func (s *DockerNetworkSuite) TestDockerNetworkInspectCustomSpecified(c *check.C) {
-	dockerCmd(c, "network", "create", "--driver=bridge", "--ipv6", "--subnet=172.28.0.0/16", "--ip-range=172.28.5.0/24", "--gateway=172.28.5.254", "br0")
+	dockerCmd(c, "network", "create", "--driver=bridge", "--ipv6", "--subnet=fd80:24e2:f998:72d6::/64", "--subnet=172.28.0.0/16", "--ip-range=172.28.5.0/24", "--gateway=172.28.5.254", "br0")
 	assertNwIsAvailable(c, "br0")
 
 	nr := getNetworkResource(c, "br0")
@@ -721,7 +721,7 @@ func (s *DockerNetworkSuite) TestDockerNetworkInspectCustomSpecified(c *check.C)
 	c.Assert(nr.Internal, checker.Equals, false)
 	c.Assert(nr.EnableIPv6, checker.Equals, true)
 	c.Assert(nr.IPAM.Driver, checker.Equals, "default")
-	c.Assert(len(nr.IPAM.Config), checker.Equals, 1)
+	c.Assert(len(nr.IPAM.Config), checker.Equals, 2)
 	c.Assert(nr.IPAM.Config[0].Subnet, checker.Equals, "172.28.0.0/16")
 	c.Assert(nr.IPAM.Config[0].IPRange, checker.Equals, "172.28.5.0/24")
 	c.Assert(nr.IPAM.Config[0].Gateway, checker.Equals, "172.28.5.254")
@@ -769,10 +769,10 @@ func (s *DockerNetworkSuite) TestDockerNetworkDriverOptions(c *check.C) {
 }
 
 func (s *DockerNetworkSuite) TestDockerPluginV2NetworkDriver(c *check.C) {
-	testRequires(c, DaemonIsLinux, ExperimentalDaemon, Network)
+	testRequires(c, DaemonIsLinux, IsAmd64, Network)
 
 	var (
-		npName        = "mavenugo/test-docker-netplugin"
+		npName        = "tiborvass/test-docker-netplugin"
 		npTag         = "latest"
 		npNameWithTag = npName + ":" + npTag
 	)
@@ -1655,16 +1655,17 @@ func (s *DockerSuite) TestDockerNetworkInternalMode(c *check.C) {
 	c.Assert(err, check.IsNil)
 }
 
-// Test for special characters in network names. only [a-zA-Z0-9][a-zA-Z0-9_.-] are
-// valid characters
+// Test for #21401
 func (s *DockerNetworkSuite) TestDockerNetworkCreateDeleteSpecialCharacters(c *check.C) {
-	_, _, err := dockerCmdWithError("network", "create", "test@#$")
-	c.Assert(err, check.NotNil)
+	dockerCmd(c, "network", "create", "test@#$")
+	assertNwIsAvailable(c, "test@#$")
+	dockerCmd(c, "network", "rm", "test@#$")
+	assertNwNotAvailable(c, "test@#$")
 
-	dockerCmd(c, "network", "create", "test-1_0.net")
-	assertNwIsAvailable(c, "test-1_0.net")
-	dockerCmd(c, "network", "rm", "test-1_0.net")
-	assertNwNotAvailable(c, "test-1_0.net")
+	dockerCmd(c, "network", "create", "kiwl$%^")
+	assertNwIsAvailable(c, "kiwl$%^")
+	dockerCmd(c, "network", "rm", "kiwl$%^")
+	assertNwNotAvailable(c, "kiwl$%^")
 }
 
 func (s *DockerDaemonSuite) TestDaemonRestartRestoreBridgeNetwork(t *check.C) {

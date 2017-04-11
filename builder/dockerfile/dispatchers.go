@@ -18,6 +18,7 @@ import (
 
 	"github.com/Sirupsen/logrus"
 	"github.com/docker/docker/api"
+	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/strslice"
 	"github.com/docker/docker/builder"
@@ -70,14 +71,20 @@ func env(b *Builder, args []string, attributes map[string]bool, original string)
 		if len(args[j]) == 0 {
 			return errBlankCommandNames("ENV")
 		}
-
 		newVar := args[j] + "=" + args[j+1] + ""
 		commitStr += " " + newVar
 
 		gotOne := false
 		for i, envVar := range b.runConfig.Env {
 			envParts := strings.SplitN(envVar, "=", 2)
-			if envParts[0] == args[j] {
+			compareFrom := envParts[0]
+			compareTo := args[j]
+			if runtime.GOOS == "windows" {
+				// Case insensitive environment variables on Windows
+				compareFrom = strings.ToUpper(compareFrom)
+				compareTo = strings.ToUpper(compareTo)
+			}
+			if compareFrom == compareTo {
 				b.runConfig.Env[i] = newVar
 				gotOne = true
 				break
@@ -279,12 +286,39 @@ func workdir(b *Builder, args []string, attributes map[string]bool, original str
 		return err
 	}
 
-	// NOTE: You won't find the "mkdir" for the directory in here. Rather we
-	// just set the value in the image's runConfig.WorkingDir property
-	// and container.SetupWorkingDirectory() will create it automatically
-	// for us the next time the image is used to create a container.
+	// For performance reasons, we explicitly do a create/mkdir now
+	// This avoids having an unnecessary expensive mount/unmount calls
+	// (on Windows in particular) during each container create.
+	// Prior to 1.13, the mkdir was deferred and not executed at this step.
+	if b.disableCommit {
+		// Don't call back into the daemon if we're going through docker commit --change "WORKDIR /foo".
+		// We've already updated the runConfig and that's enough.
+		return nil
+	}
+	b.runConfig.Image = b.image
 
-	return b.commit("", b.runConfig.Cmd, fmt.Sprintf("WORKDIR %v", b.runConfig.WorkingDir))
+	cmd := b.runConfig.Cmd
+	comment := "WORKDIR " + b.runConfig.WorkingDir
+	// reset the command for cache detection
+	b.runConfig.Cmd = strslice.StrSlice(append(getShell(b.runConfig), "#(nop) "+comment))
+	defer func(cmd strslice.StrSlice) { b.runConfig.Cmd = cmd }(cmd)
+
+	if hit, err := b.probeCache(); err != nil {
+		return err
+	} else if hit {
+		return nil
+	}
+
+	container, err := b.docker.ContainerCreate(types.ContainerCreateConfig{Config: b.runConfig})
+	if err != nil {
+		return err
+	}
+	b.tmpContainers[container.ID] = struct{}{}
+	if err := b.docker.ContainerCreateWorkdir(container.ID); err != nil {
+		return err
+	}
+
+	return b.commit(container.ID, cmd, comment)
 }
 
 // RUN some command yo
@@ -352,8 +386,8 @@ func run(b *Builder, args []string, attributes map[string]bool, original string)
 			// the entire file (see 'leftoverArgs' processing in evaluator.go )
 			continue
 		}
-		if _, ok := configEnv[key]; !ok {
-			cmdBuildEnv = append(cmdBuildEnv, fmt.Sprintf("%s=%s", key, val))
+		if _, ok := configEnv[key]; !ok && val != nil {
+			cmdBuildEnv = append(cmdBuildEnv, fmt.Sprintf("%s=%s", key, *val))
 		}
 	}
 
@@ -696,7 +730,7 @@ func arg(b *Builder, args []string, attributes map[string]bool, original string)
 
 	var (
 		name       string
-		value      string
+		newValue   string
 		hasDefault bool
 	)
 
@@ -713,7 +747,7 @@ func arg(b *Builder, args []string, attributes map[string]bool, original string)
 		}
 
 		name = parts[0]
-		value = parts[1]
+		newValue = parts[1]
 		hasDefault = true
 	} else {
 		name = arg
@@ -724,9 +758,12 @@ func arg(b *Builder, args []string, attributes map[string]bool, original string)
 
 	// If there is a default value associated with this arg then add it to the
 	// b.buildArgs if one is not already passed to the builder. The args passed
-	// to builder override the default value of 'arg'.
-	if _, ok := b.options.BuildArgs[name]; !ok && hasDefault {
-		b.options.BuildArgs[name] = value
+	// to builder override the default value of 'arg'. Note that a 'nil' for
+	// a value means that the user specified "--build-arg FOO" and "FOO" wasn't
+	// defined as an env var - and in that case we DO want to use the default
+	// value specified in the ARG cmd.
+	if baValue, ok := b.options.BuildArgs[name]; (!ok || baValue == nil) && hasDefault {
+		b.options.BuildArgs[name] = &newValue
 	}
 
 	return b.commit("", b.runConfig.Cmd, fmt.Sprintf("ARG %s", arg))

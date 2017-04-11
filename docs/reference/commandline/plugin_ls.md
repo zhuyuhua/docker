@@ -2,7 +2,6 @@
 title: "plugin ls"
 description: "The plugin ls command description and usage"
 keywords: "plugin, list"
-advisory: "experimental"
 ---
 
 <!-- This file is maintained within the docker/docker Github
@@ -14,7 +13,7 @@ advisory: "experimental"
      will be rejected.
 -->
 
-# plugin ls (experimental)
+# plugin ls
 
 ```markdown
 Usage:  docker plugin ls [OPTIONS]
@@ -29,24 +28,28 @@ Options:
       --no-trunc   Don't truncate output
 ```
 
+## Description
+
 Lists all the plugins that are currently installed. You can install plugins
 using the [`docker plugin install`](plugin_install.md) command.
 
-Example output:
+## Examples
 
 ```bash
 $ docker plugin ls
 
-NAME                  TAG                 DESCRIPTION                ENABLED
-tiborvass/no-remove   latest              A test plugin for Docker   true
+ID                  NAME                             TAG                 DESCRIPTION                ENABLED
+69553ca1d123        tiborvass/sample-volume-plugin   latest              A test plugin for Docker   true
 ```
 
-## Related information
+## Related commands
 
 * [plugin create](plugin_create.md)
-* [plugin enable](plugin_enable.md)
 * [plugin disable](plugin_disable.md)
+* [plugin enable](plugin_enable.md)
 * [plugin inspect](plugin_inspect.md)
 * [plugin install](plugin_install.md)
+* [plugin push](plugin_push.md)
 * [plugin rm](plugin_rm.md)
 * [plugin set](plugin_set.md)
+* [plugin upgrade](plugin_upgrade.md)

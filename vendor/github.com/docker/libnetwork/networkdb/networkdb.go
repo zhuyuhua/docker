@@ -24,14 +24,19 @@ const (
 // NetworkDB instance drives the networkdb cluster and acts the broker
 // for cluster-scoped and network-scoped gossip and watches.
 type NetworkDB struct {
+	// The clocks MUST be the first things
+	// in this struct due to Golang issue #599.
+
+	// Global lamport clock for node network attach events.
+	networkClock serf.LamportClock
+
+	// Global lamport clock for table events.
+	tableClock serf.LamportClock
+
 	sync.RWMutex
 
 	// NetworkDB configuration.
 	config *Config
-
-	// local copy of memberlist config that we use to driver
-	// network scoped gossip and bulk sync.
-	mConfig *memberlist.Config
 
 	// All the tree index (byTable, byNetwork) that we maintain
 	// the db.
@@ -57,18 +62,11 @@ type NetworkDB struct {
 
 	// A map of nodes which are participating in a given
 	// network. The key is a network ID.
-
 	networkNodes map[string][]string
 
 	// A table of ack channels for every node from which we are
 	// waiting for an ack.
 	bulkSyncAckTbl map[string]chan struct{}
-
-	// Global lamport clock for node network attach events.
-	networkClock serf.LamportClock
-
-	// Global lamport clock for table events.
-	tableClock serf.LamportClock
 
 	// Broadcast queue for network event gossip.
 	networkBroadcasts *memberlist.TransmitLimitedQueue
@@ -213,10 +211,12 @@ func (nDB *NetworkDB) Peers(nid string) []PeerInfo {
 	defer nDB.RUnlock()
 	peers := make([]PeerInfo, 0, len(nDB.networkNodes[nid]))
 	for _, nodeName := range nDB.networkNodes[nid] {
-		peers = append(peers, PeerInfo{
-			Name: nDB.nodes[nodeName].Name,
-			IP:   nDB.nodes[nodeName].Addr.String(),
-		})
+		if node, ok := nDB.nodes[nodeName]; ok {
+			peers = append(peers, PeerInfo{
+				Name: node.Name,
+				IP:   node.Addr.String(),
+			})
+		}
 	}
 	return peers
 }
@@ -246,7 +246,7 @@ func (nDB *NetworkDB) getEntry(tname, nid, key string) (*entry, error) {
 
 // CreateEntry creates a table entry in NetworkDB for given (network,
 // table, key) tuple and if the NetworkDB is part of the cluster
-// propogates this event to the cluster. It is an error to create an
+// propagates this event to the cluster. It is an error to create an
 // entry for the same tuple for which there is already an existing
 // entry unless the current entry is deleting state.
 func (nDB *NetworkDB) CreateEntry(tname, nid, key string, value []byte) error {
@@ -267,7 +267,7 @@ func (nDB *NetworkDB) CreateEntry(tname, nid, key string, value []byte) error {
 	}
 
 	if err := nDB.sendTableEvent(TableEventTypeCreate, nid, tname, key, entry); err != nil {
-		return fmt.Errorf("cannot send table create event: %v", err)
+		return fmt.Errorf("cannot send create event for table %s, %v", tname, err)
 	}
 
 	nDB.Lock()
@@ -281,7 +281,7 @@ func (nDB *NetworkDB) CreateEntry(tname, nid, key string, value []byte) error {
 
 // UpdateEntry updates a table entry in NetworkDB for given (network,
 // table, key) tuple and if the NetworkDB is part of the cluster
-// propogates this event to the cluster. It is an error to update a
+// propagates this event to the cluster. It is an error to update a
 // non-existent entry.
 func (nDB *NetworkDB) UpdateEntry(tname, nid, key string, value []byte) error {
 	if _, err := nDB.GetEntry(tname, nid, key); err != nil {
@@ -309,7 +309,7 @@ func (nDB *NetworkDB) UpdateEntry(tname, nid, key string, value []byte) error {
 
 // DeleteEntry deletes a table entry in NetworkDB for given (network,
 // table, key) tuple and if the NetworkDB is part of the cluster
-// propogates this event to the cluster.
+// propagates this event to the cluster.
 func (nDB *NetworkDB) DeleteEntry(tname, nid, key string) error {
 	value, err := nDB.GetEntry(tname, nid, key)
 	if err != nil {
@@ -410,7 +410,7 @@ func (nDB *NetworkDB) WalkTable(tname string, fn func(string, string, []byte) bo
 	return nil
 }
 
-// JoinNetwork joins this node to a given network and propogates this
+// JoinNetwork joins this node to a given network and propagates this
 // event across the cluster. This triggers this node joining the
 // sub-cluster of this network and participates in the network-scoped
 // gossip and bulk sync for this network.
@@ -449,7 +449,7 @@ func (nDB *NetworkDB) JoinNetwork(nid string) error {
 	return nil
 }
 
-// LeaveNetwork leaves this node from a given network and propogates
+// LeaveNetwork leaves this node from a given network and propagates
 // this event across the cluster. This triggers this node leaving the
 // sub-cluster of this network and as a result will no longer
 // participate in the network-scoped gossip and bulk sync for this

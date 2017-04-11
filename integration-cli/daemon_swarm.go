@@ -139,17 +139,23 @@ func (d *SwarmDaemon) getServiceTasks(c *check.C, service string) []swarm.Task {
 	return tasks
 }
 
-func (d *SwarmDaemon) checkServiceRunningTasks(service string) func(*check.C) (interface{}, check.CommentInterface) {
+func (d *SwarmDaemon) checkServiceTasksInState(service string, state swarm.TaskState, message string) func(*check.C) (interface{}, check.CommentInterface) {
 	return func(c *check.C) (interface{}, check.CommentInterface) {
 		tasks := d.getServiceTasks(c, service)
-		var runningCount int
+		var count int
 		for _, task := range tasks {
-			if task.Status.State == swarm.TaskStateRunning {
-				runningCount++
+			if task.Status.State == state {
+				if message == "" || strings.Contains(task.Status.Message, message) {
+					count++
+				}
 			}
 		}
-		return runningCount, nil
+		return count, nil
 	}
+}
+
+func (d *SwarmDaemon) checkServiceRunningTasks(service string) func(*check.C) (interface{}, check.CommentInterface) {
+	return d.checkServiceTasksInState(service, swarm.TaskStateRunning, "")
 }
 
 func (d *SwarmDaemon) checkServiceUpdateState(service string) func(*check.C) (interface{}, check.CommentInterface) {
@@ -285,7 +291,7 @@ func (d *SwarmDaemon) listServices(c *check.C) []swarm.Service {
 }
 
 func (d *SwarmDaemon) createSecret(c *check.C, secretSpec swarm.SecretSpec) string {
-	status, out, err := d.SockRequest("POST", "/secrets", secretSpec)
+	status, out, err := d.SockRequest("POST", "/secrets/create", secretSpec)
 
 	c.Assert(err, checker.IsNil, check.Commentf(string(out)))
 	c.Assert(status, checker.Equals, http.StatusCreated, check.Commentf("output: %q", string(out)))
@@ -317,7 +323,7 @@ func (d *SwarmDaemon) getSecret(c *check.C, id string) *swarm.Secret {
 func (d *SwarmDaemon) deleteSecret(c *check.C, id string) {
 	status, out, err := d.SockRequest("DELETE", "/secrets/"+id, nil)
 	c.Assert(err, checker.IsNil, check.Commentf(string(out)))
-	c.Assert(status, checker.Equals, http.StatusOK, check.Commentf("output: %q", string(out)))
+	c.Assert(status, checker.Equals, http.StatusNoContent, check.Commentf("output: %q", string(out)))
 }
 
 func (d *SwarmDaemon) getSwarm(c *check.C) swarm.Swarm {

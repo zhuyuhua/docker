@@ -2,12 +2,7 @@
 set -e
 set -x
 
-TOMLV_COMMIT=9baf8a8a9f2ed20a8e54160840c492f937eeaf9a
-RUNC_COMMIT=ac031b5bf1cc92239461125f4c1ffb760522bbf2
-CONTAINERD_COMMIT=8517738ba4b82aff5662c97ca4627e7e4d03b531
-TINI_COMMIT=v0.13.0
-LIBNETWORK_COMMIT=0f534354b813003a754606689722fe253101bc4e
-VNDR_COMMIT=f56bd4504b4fad07a357913687fb652ee54bb3b0
+. $(dirname "$0")/binaries-commits
 
 RM_GOPATH=0
 
@@ -51,6 +46,14 @@ install_proxy() {
 	go build -ldflags="$PROXY_LDFLAGS" -o /usr/local/bin/docker-proxy github.com/docker/libnetwork/cmd/proxy
 }
 
+install_bindata() {
+    echo "Install go-bindata version $BINDATA_COMMIT"
+    git clone https://github.com/jteeuwen/go-bindata "$GOPATH/src/github.com/jteeuwen/go-bindata"
+    cd $GOPATH/src/github.com/jteeuwen/go-bindata
+    git checkout -q "$BINDATA_COMMIT"
+	go build -o /usr/local/bin/go-bindata github.com/jteeuwen/go-bindata/go-bindata
+}
+
 for prog in "$@"
 do
 	case $prog in
@@ -82,7 +85,7 @@ do
 			git clone https://github.com/krallin/tini.git "$GOPATH/tini"
 			cd "$GOPATH/tini"
 			git checkout -q "$TINI_COMMIT"
-			cmake -DMINIMAL=ON .
+			cmake .
 			make tini-static
 			cp tini-static /usr/local/bin/docker-init
 			;;
@@ -103,6 +106,10 @@ do
 			git checkout -q "$VNDR_COMMIT"
 			go build -v -o /usr/local/bin/vndr .
 			;;
+
+        bindata)
+            install_bindata
+            ;;
 
 		*)
 			echo echo "Usage: $0 [tomlv|runc|containerd|tini|proxy]"

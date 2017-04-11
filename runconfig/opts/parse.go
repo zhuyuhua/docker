@@ -14,7 +14,6 @@ import (
 	networktypes "github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/strslice"
 	"github.com/docker/docker/opts"
-	"github.com/docker/docker/pkg/mount"
 	"github.com/docker/docker/pkg/signal"
 	"github.com/docker/go-connections/nat"
 	units "github.com/docker/go-units"
@@ -26,7 +25,6 @@ type ContainerOptions struct {
 	attach             opts.ListOpts
 	volumes            opts.ListOpts
 	tmpfs              opts.ListOpts
-	mounts             opts.MountOpt
 	blkioWeightDevice  WeightdeviceOpt
 	deviceReadBps      ThrottledeviceOpt
 	deviceWriteBps     ThrottledeviceOpt
@@ -218,7 +216,6 @@ func AddFlags(flags *pflag.FlagSet) *ContainerOptions {
 	flags.Var(&copts.tmpfs, "tmpfs", "Mount a tmpfs directory")
 	flags.Var(&copts.volumesFrom, "volumes-from", "Mount volumes from the specified container(s)")
 	flags.VarP(&copts.volumes, "volume", "v", "Bind mount a volume")
-	flags.Var(&copts.mounts, "mount", "Attach a filesystem mount to the container")
 
 	// Health-checking
 	flags.StringVar(&copts.healthCmd, "health-cmd", "", "Command to run to check health")
@@ -358,8 +355,6 @@ func Parse(flags *pflag.FlagSet, copts *ContainerOptions) (*container.Config, *c
 		}
 	}
 
-	mounts := copts.mounts.Value()
-
 	var binds []string
 	volumes := copts.volumes.GetMap()
 	// add any bind targets to the list of container volumes
@@ -378,9 +373,6 @@ func Parse(flags *pflag.FlagSet, copts *ContainerOptions) (*container.Config, *c
 	tmpfs := make(map[string]string)
 	for _, t := range copts.tmpfs.GetAll() {
 		if arr := strings.SplitN(t, ":", 2); len(arr) > 1 {
-			if _, _, err := mount.ParseTmpfsOptions(arr[1]); err != nil {
-				return nil, nil, nil, err
-			}
 			tmpfs[arr[0]] = arr[1]
 		} else {
 			tmpfs[arr[0]] = ""
@@ -627,7 +619,10 @@ func Parse(flags *pflag.FlagSet, copts *ContainerOptions) (*container.Config, *c
 		Tmpfs:          tmpfs,
 		Sysctls:        copts.sysctls.GetAll(),
 		Runtime:        copts.runtime,
-		Mounts:         mounts,
+	}
+
+	if copts.autoRemove && !hostConfig.RestartPolicy.IsNone() {
+		return nil, nil, nil, fmt.Errorf("Conflicting options: --restart and --rm")
 	}
 
 	// only set this value if the user provided the flag, else it should default to nil
@@ -714,6 +709,25 @@ func ConvertKVStringsToMap(values []string) map[string]string {
 	return result
 }
 
+// ConvertKVStringsToMapWithNil converts ["key=value"] to {"key":"value"}
+// but set unset keys to nil - meaning the ones with no "=" in them.
+// We use this in cases where we need to distinguish between
+//   FOO=  and FOO
+// where the latter case just means FOO was mentioned but not given a value
+func ConvertKVStringsToMapWithNil(values []string) map[string]*string {
+	result := make(map[string]*string, len(values))
+	for _, value := range values {
+		kv := strings.SplitN(value, "=", 2)
+		if len(kv) == 1 {
+			result[kv[0]] = nil
+		} else {
+			result[kv[0]] = &kv[1]
+		}
+	}
+
+	return result
+}
+
 func parseLoggingOpts(loggingDriver string, loggingOpts []string) (map[string]string, error) {
 	loggingOptsMap := ConvertKVStringsToMap(loggingOpts)
 	if loggingDriver == "none" && len(loggingOpts) > 0 {
@@ -757,7 +771,7 @@ func parseStorageOpts(storageOpts []string) (map[string]string, error) {
 			opt := strings.SplitN(option, "=", 2)
 			m[opt[0]] = opt[1]
 		} else {
-			return nil, fmt.Errorf("Invalid storage option.")
+			return nil, fmt.Errorf("invalid storage option")
 		}
 	}
 	return m, nil

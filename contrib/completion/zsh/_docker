@@ -348,14 +348,14 @@ __docker_complete_ps_filters() {
                 __docker_complete_containers_names && ret=0
                 ;;
             (network)
-                __docker_networks && ret=0
+                __docker_complete_networks && ret=0
                 ;;
             (status)
                 status_opts=('created' 'dead' 'exited' 'paused' 'restarting' 'running' 'removing')
                 _describe -t status-filter-opts "status filter options" status_opts && ret=0
                 ;;
             (volume)
-                __docker_volumes && ret=0
+                __docker_complete_volumes && ret=0
                 ;;
             *)
                 _message 'value' && ret=0
@@ -399,11 +399,11 @@ __docker_complete_images_filters() {
     declare -a boolean_opts opts
 
     boolean_opts=('true' 'false')
-    opts=('before' 'dangling' 'label' 'since')
+    opts=('before' 'dangling' 'label' 'reference' 'since')
 
     if compset -P '*='; then
         case "${${words[-1]%=*}#*=}" in
-            (before|since)
+            (before|reference|since)
                 __docker_complete_images && ret=0
                 ;;
             (dangling)
@@ -453,7 +453,7 @@ __docker_complete_events_filter() {
                 __docker_complete_images && ret=0
                 ;;
             (network)
-                __docker_networks && ret=0
+                __docker_complete_networks && ret=0
                 ;;
             (type)
                 local -a type_opts
@@ -461,7 +461,7 @@ __docker_complete_events_filter() {
                 _describe -t type-filter-opts "type filter options" type_opts && ret=0
                 ;;
             (volume)
-                __docker_volumes && ret=0
+                __docker_complete_volumes && ret=0
                 ;;
             *)
                 _message 'value' && ret=0
@@ -473,6 +473,77 @@ __docker_complete_events_filter() {
 
     return ret
 }
+
+__docker_complete_prune_filters() {
+    [[ $PREFIX = -* ]] && return 1
+    integer ret=1
+    declare -a opts
+
+    opts=('until')
+
+    if compset -P '*='; then
+        case "${${words[-1]%=*}#*=}" in
+            *)
+                _message 'value' && ret=0
+                ;;
+        esac
+    else
+        _describe -t filter-opts "filter options" opts -qS "=" && ret=0
+    fi
+
+    return ret
+}
+
+# BO checkpoint
+
+__docker_checkpoint_commands() {
+    local -a _docker_checkpoint_subcommands
+    _docker_checkpoint_subcommands=(
+        "create:Create a checkpoint from a running container"
+        "ls:List checkpoints for a container"
+        "rm:Remove a checkpoint"
+    )
+    _describe -t docker-checkpoint-commands "docker checkpoint command" _docker_checkpoint_subcommands
+}
+
+__docker_checkpoint_subcommand() {
+    local -a _command_args opts_help
+    local expl help="--help"
+    integer ret=1
+
+    opts_help=("(: -)--help[Print usage]")
+
+    case "$words[1]" in
+        (create)
+            _arguments $(__docker_arguments) \
+                $opts_help \
+                "($help)--checkpoint-dir=[Use a custom checkpoint storage directory]:dir:_directories" \
+                "($help)--leave-running[Leave the container running after checkpoint]" \
+                "($help -)1:container:__docker_complete_running_containers" \
+                "($help -)2:checkpoint: " && ret=0
+            ;;
+        (ls|list)
+            _arguments $(__docker_arguments) \
+                $opts_help \
+                "($help)--checkpoint-dir=[Use a custom checkpoint storage directory]:dir:_directories" \
+                "($help -)1:container:__docker_complete_containers" && ret=0
+            ;;
+        (rm|remove)
+            _arguments $(__docker_arguments) \
+                $opts_help \
+                "($help)--checkpoint-dir=[Use a custom checkpoint storage directory]:dir:_directories" \
+                "($help -)1:container:__docker_complete_containers" \
+                "($help -)2:checkpoint: " && ret=0
+            ;;
+        (help)
+            _arguments $(__docker_arguments) ":subcommand:__docker_checkpoint_commands" && ret=0
+            ;;
+    esac
+
+    return ret
+}
+
+# EO checkpoint
 
 # BO container
 
@@ -524,6 +595,7 @@ __docker_container_subcommand() {
         "($help)*--cap-drop=[Drop Linux capabilities]:capability: "
         "($help)--cgroup-parent=[Parent cgroup for the container]:cgroup: "
         "($help)--cidfile=[Write the container ID to the file]:CID file:_files"
+        "($help)--cpus=[Number of CPUs (default 0.000)]:cpus: "
         "($help)*--device=[Add a host device to the container]:device:_files"
         "($help)*--device-read-bps=[Limit the read rate (bytes per second) from a device]:device:IO rate: "
         "($help)*--device-read-iops=[Limit the read rate (IO per second) from a device]:device:IO rate: "
@@ -540,6 +612,7 @@ __docker_container_subcommand() {
         "($help)*--group=[Set one or more supplementary user groups for the container]:group:_groups"
         "($help -h --hostname)"{-h=,--hostname=}"[Container host name]:hostname:_hosts"
         "($help -i --interactive)"{-i,--interactive}"[Keep stdin open even if not attached]"
+        "($help)--init[Run an init inside the container that forwards signals and reaps processes]"
         "($help)--ip=[Container IPv4 address]:IPv4: "
         "($help)--ip6=[Container IPv6 address]:IPv6: "
         "($help)--ipc=[IPC namespace to use]:IPC namespace: "
@@ -550,7 +623,6 @@ __docker_container_subcommand() {
         "($help)--log-driver=[Default driver for container logs]:logging driver:__docker_complete_log_drivers"
         "($help)*--log-opt=[Log driver specific options]:log driver options:__docker_complete_log_options"
         "($help)--mac-address=[Container MAC address]:MAC address: "
-        "($help)*--mount=[Attach a filesystem mount to the container]:mount: "
         "($help)--name=[Container name]:name: "
         "($help)--network=[Connect a container to a network]:network mode:(bridge none container host)"
         "($help)*--network-alias=[Add network-scoped alias for the container]:alias: "
@@ -729,7 +801,10 @@ __docker_container_subcommand() {
                 "($help -)2:port:_ports" && ret=0
             ;;
         (prune)
-            # @TODO
+            _arguments $(__docker_arguments) \
+                $opts_help \
+                "($help)*--filter=[Filter values]:filter:__docker_complete_prune_filters" \
+                "($help -f --force)"{-f,--force}"[Do not prompt for confirmation]" && ret=0
             ;;
         (rename)
             _arguments $(__docker_arguments) \
@@ -897,7 +972,8 @@ __docker_image_subcommand() {
         (build)
             _arguments $(__docker_arguments) \
                 $opts_help \
-                "($help)*--build-arg[Build-time variables]:<varname>=<value>: " \
+                "($help)*--build-arg=[Build-time variables]:<varname>=<value>: " \
+                "($help)*--cache-from=[Images to consider as cache sources]: :__docker_complete_repositories_with_tags" \
                 "($help -c --cpu-shares)"{-c=,--cpu-shares=}"[CPU shares (relative weight)]:CPU shares:(0 10 100 200 500 800 1000)" \
                 "($help)--cgroup-parent=[Parent cgroup for the container]:cgroup: " \
                 "($help)--compress[Compress the build context using gzip]" \
@@ -914,11 +990,13 @@ __docker_image_subcommand() {
                 "($help)*--label=[Set metadata for an image]:label=value: " \
                 "($help -m --memory)"{-m=,--memory=}"[Memory limit]:Memory limit: " \
                 "($help)--memory-swap=[Total memory limit with swap]:Memory limit: " \
+                "($help)--network=[Connect a container to a network]:network mode:(bridge none container host)" \
                 "($help)--no-cache[Do not use cache when building the image]" \
                 "($help)--pull[Attempt to pull a newer version of the image]" \
                 "($help -q --quiet)"{-q,--quiet}"[Suppress verbose build output]" \
                 "($help)--rm[Remove intermediate containers after a successful build]" \
                 "($help)*--shm-size=[Size of '/dev/shm' (format is '<number><unit>')]:shm size: " \
+                "($help)--squash[Squash newly built layers into a single new layer]" \
                 "($help -t --tag)*"{-t=,--tag=}"[Repository, name and tag for the image]: :__docker_complete_repositories_with_tags" \
                 "($help)*--ulimit=[ulimit options]:ulimit: " \
                 "($help)--userns=[Container user namespace]:user namespace:(host)" \
@@ -970,7 +1048,11 @@ __docker_image_subcommand() {
             esac
             ;;
         (prune)
-            # @TODO
+            _arguments $(__docker_arguments) \
+                $opts_help \
+                "($help -a --all)"{-a,--all}"[Remove all unused images, not just dangling ones]" \
+                "($help)*--filter=[Filter values]:filter:__docker_complete_prune_filters" \
+                "($help -f --force)"{-f,--force}"[Do not prompt for confirmation]" && ret=0
             ;;
         (pull)
             _arguments $(__docker_arguments) \
@@ -1026,10 +1108,10 @@ __docker_network_complete_ls_filters() {
                 __docker_complete_info_plugins Network && ret=0
                 ;;
             (id)
-                __docker_networks_ids && ret=0
+                __docker_complete_networks_ids && ret=0
                 ;;
             (name)
-                __docker_networks_names && ret=0
+                __docker_complete_networks_names && ret=0
                 ;;
             (type)
                 type_opts=('builtin' 'custom')
@@ -1075,6 +1157,7 @@ __docker_get_networks() {
         for line in $lines; do
             s="${line[${begin[NETWORK ID]},${end[NETWORK ID]}]%% ##}"
             s="$s:${(l:7:: :::)${${line[${begin[DRIVER]},${end[DRIVER]}]}%% ##}}"
+            s="$s, ${${line[${begin[SCOPE]},${end[SCOPE]}]}%% ##}"
             networks=($networks $s)
         done
     fi
@@ -1084,6 +1167,7 @@ __docker_get_networks() {
         for line in $lines; do
             s="${line[${begin[NAME]},${end[NAME]}]%% ##}"
             s="$s:${(l:7:: :::)${${line[${begin[DRIVER]},${end[DRIVER]}]}%% ##}}"
+            s="$s, ${${line[${begin[SCOPE]},${end[SCOPE]}]}%% ##}"
             networks=($networks $s)
         done
     fi
@@ -1092,17 +1176,17 @@ __docker_get_networks() {
     return ret
 }
 
-__docker_networks() {
+__docker_complete_networks() {
     [[ $PREFIX = -* ]] && return 1
     __docker_get_networks all "$@"
 }
 
-__docker_networks_ids() {
+__docker_complete_networks_ids() {
     [[ $PREFIX = -* ]] && return 1
     __docker_get_networks ids "$@"
 }
 
-__docker_networks_names() {
+__docker_complete_networks_names() {
     [[ $PREFIX = -* ]] && return 1
     __docker_get_networks names "$@"
 }
@@ -1115,6 +1199,7 @@ __docker_network_commands() {
         "disconnect:Disconnects a container from a network"
         "inspect:Displays detailed information on a network"
         "ls:Lists all the networks created by the user"
+        "prune:Remove all unused networks"
         "rm:Deletes one or more networks"
     )
     _describe -t docker-network-commands "docker network command" _docker_network_subcommands
@@ -1136,7 +1221,7 @@ __docker_network_subcommand() {
                 "($help)--ip6=[Container IPv6 address]:IPv6: " \
                 "($help)*--link=[Add a link to another container]:link:->link" \
                 "($help)*--link-local-ip=[Add a link-local address for the container]:IPv4/IPv6: " \
-                "($help -)1:network:__docker_networks" \
+                "($help -)1:network:__docker_complete_networks" \
                 "($help -)2:containers:__docker_complete_containers" && ret=0
 
             case $state in
@@ -1152,6 +1237,7 @@ __docker_network_subcommand() {
         (create)
             _arguments $(__docker_arguments) -A '-*' \
                 $opts_help \
+                "($help)--attachable[Enable manual container attachment]" \
                 "($help)*--aux-address[Auxiliary IPv4 or IPv6 addresses used by network driver]:key=IP: " \
                 "($help -d --driver)"{-d=,--driver=}"[Driver to manage the Network]:driver:(null host bridge overlay)" \
                 "($help)*--gateway=[IPv4 or IPv6 Gateway for the master subnet]:IP: " \
@@ -1168,14 +1254,14 @@ __docker_network_subcommand() {
         (disconnect)
             _arguments $(__docker_arguments) \
                 $opts_help \
-                "($help -)1:network:__docker_networks" \
+                "($help -)1:network:__docker_complete_networks" \
                 "($help -)2:containers:__docker_complete_containers" && ret=0
             ;;
         (inspect)
             _arguments $(__docker_arguments) \
                 $opts_help \
                 "($help -f --format)"{-f=,--format=}"[Format the output using the given go template]:template: " \
-                "($help -)*:network:__docker_networks" && ret=0
+                "($help -)*:network:__docker_complete_networks" && ret=0
             ;;
         (ls)
             _arguments $(__docker_arguments) \
@@ -1190,10 +1276,16 @@ __docker_network_subcommand() {
                     ;;
             esac
             ;;
+        (prune)
+            _arguments $(__docker_arguments) \
+                $opts_help \
+                "($help)*--filter=[Filter values]:filter:__docker_complete_prune_filters" \
+                "($help -f --force)"{-f,--force}"[Do not prompt for confirmation]" && ret=0
+            ;;
         (rm)
             _arguments $(__docker_arguments) \
                 $opts_help \
-                "($help -)*:network:__docker_networks" && ret=0
+                "($help -)*:network:__docker_complete_networks" && ret=0
             ;;
         (help)
             _arguments $(__docker_arguments) ":subcommand:__docker_network_commands" && ret=0
@@ -1360,7 +1452,7 @@ __docker_node_subcommand() {
         (rm|remove)
              _arguments $(__docker_arguments) \
                 $opts_help \
-                "($help)--force[Force remove a node from the swarm]" \
+                "($help -f --force)"{-f,--force}"[Force remove a node from the swarm]" \
                 "($help -)*:node:__docker_complete_pending_nodes" && ret=0
             ;;
         (demote)
@@ -1469,6 +1561,7 @@ __docker_plugin_commands() {
         "push:Push a plugin"
         "rm:Remove a plugin"
         "set:Change settings for a plugin"
+        "upgrade:Upgrade an existing plugin"
     )
     _describe -t docker-plugin-commands "docker plugin command" _docker_plugin_subcommands
 }
@@ -1481,16 +1574,65 @@ __docker_plugin_subcommand() {
     opts_help=("(: -)--help[Print usage]")
 
     case "$words[1]" in
-        (disable|enable|inspect|install|ls|push|rm)
+        (disable)
             _arguments $(__docker_arguments) \
                 $opts_help \
+                "($help -f --force)"{-f,--force}"[Force the disable of an active plugin]" \
                 "($help -)1:plugin:__docker_complete_plugins" && ret=0
+            ;;
+        (enable)
+            _arguments $(__docker_arguments) \
+                $opts_help \
+                "($help)--timeout=[HTTP client timeout (in seconds)]:timeout: " \
+                "($help -)1:plugin:__docker_complete_plugins" && ret=0
+            ;;
+        (inspect)
+            _arguments $(__docker_arguments) \
+                $opts_help \
+                "($help -f --format)"{-f=,--format=}"[Format the output using the given Go template]:template: " \
+                "($help -)*:plugin:__docker_complete_plugins" && ret=0
+            ;;
+        (install)
+            _arguments $(__docker_arguments) \
+                $opts_help \
+                "($help)--alias=[Local name for plugin]:alias: " \
+                "($help)--disable[Do not enable the plugin on install]" \
+                "($help)--disable-content-trust[Skip image verification (default true)]" \
+                "($help)--grant-all-permissions[Grant all permissions necessary to run the plugin]" \
+                "($help -)1:plugin:__docker_complete_plugins" \
+                "($help -)*:key=value: " && ret=0
+            ;;
+        (ls|list)
+            _arguments $(__docker_arguments) \
+                $opts_help \
+                "($help)--no-trunc[Don't truncate output]" && ret=0
+            ;;
+        (push)
+            _arguments $(__docker_arguments) \
+                $opts_help \
+                "($help)--disable-content-trust[Skip image verification (default true)]" \
+                "($help -)1:plugin:__docker_complete_plugins" && ret=0
+            ;;
+        (rm|remove)
+            _arguments $(__docker_arguments) \
+                $opts_help \
+                "($help -f --force)"{-f,--force}"[Force the removal of an active plugin]" \
+                "($help -)*:plugin:__docker_complete_plugins" && ret=0
             ;;
         (set)
             _arguments $(__docker_arguments) \
                 $opts_help \
                 "($help -)1:plugin:__docker_complete_plugins" \
-                "($help-)*:key=value: " && ret=0
+                "($help -)*:key=value: " && ret=0
+            ;;
+        (upgrade)
+            _arguments $(__docker_arguments) \
+                $opts_help \
+                "($help)--disable-content-trust[Skip image verification (default true)]" \
+                "($help)--grant-all-permissions[Grant all permissions necessary to run the plugin]" \
+                "($help)--skip-remote-check[Do not check if specified remote plugin matches existing plugin image]" \
+                "($help -)1:plugin:__docker_complete_plugins" \
+                "($help -):remote: " && ret=0
             ;;
         (help)
             _arguments $(__docker_arguments) ":subcommand:__docker_plugin_commands" && ret=0
@@ -1501,6 +1643,107 @@ __docker_plugin_subcommand() {
 }
 
 # EO plugin
+
+# BO secret
+
+__docker_secrets() {
+    [[ $PREFIX = -* ]] && return 1
+    integer ret=1
+    local line s
+    declare -a lines secrets
+
+    type=$1; shift
+
+    lines=(${(f)${:-"$(_call_program commands docker $docker_options secret ls)"$'\n'}})
+
+    # Parse header line to find columns
+    local i=1 j=1 k header=${lines[1]}
+    declare -A begin end
+    while (( j < ${#header} - 1 )); do
+        i=$(( j + ${${header[$j,-1]}[(i)[^ ]]} - 1 ))
+        j=$(( i + ${${header[$i,-1]}[(i)  ]} - 1 ))
+        k=$(( j + ${${header[$j,-1]}[(i)[^ ]]} - 2 ))
+        begin[${header[$i,$((j-1))]}]=$i
+        end[${header[$i,$((j-1))]}]=$k
+    done
+    end[${header[$i,$((j-1))]}]=-1
+    lines=(${lines[2,-1]})
+
+    # ID
+    if [[ $type = (ids|all) ]]; then
+        for line in $lines; do
+            s="${line[${begin[ID]},${end[ID]}]%% ##}"
+            secrets=($secrets $s)
+        done
+    fi
+
+    # Names
+    if [[ $type = (names|all) ]]; then
+        for line in $lines; do
+            s="${line[${begin[NAME]},${end[NAME]}]%% ##}"
+            secrets=($secrets $s)
+        done
+    fi
+
+    _describe -t secrets-list "secrets" secrets "$@" && ret=0
+    return ret
+}
+
+__docker_complete_secrets() {
+    [[ $PREFIX = -* ]] && return 1
+    __docker_secrets all "$@"
+}
+
+__docker_secret_commands() {
+    local -a _docker_secret_subcommands
+    _docker_secret_subcommands=(
+        "create:Create a secret using stdin as content"
+        "inspect:Display detailed information on one or more secrets"
+        "ls:List secrets"
+        "rm:Remove one or more secrets"
+    )
+    _describe -t docker-secret-commands "docker secret command" _docker_secret_subcommands
+}
+
+__docker_secret_subcommand() {
+    local -a _command_args opts_help
+    local expl help="--help"
+    integer ret=1
+
+    opts_help=("(: -)--help[Print usage]")
+
+    case "$words[1]" in
+        (create)
+            _arguments $(__docker_arguments) -A '-*' \
+                $opts_help \
+                "($help)*"{-l=,--label=}"[Secret labels]:label: " \
+                "($help -):secret: " && ret=0
+            ;;
+        (inspect)
+            _arguments $(__docker_arguments) \
+                $opts_help \
+                "($help -f --format)"{-f=,--format=}"[Format the output using the given Go template]:template: " \
+                "($help -)*:secret:__docker_complete_secrets" && ret=0
+            ;;
+        (ls|list)
+            _arguments $(__docker_arguments) \
+                $opts_help \
+                "($help -q --quiet)"{-q,--quiet}"[Only display IDs]" && ret=0
+            ;;
+        (rm|remove)
+            _arguments $(__docker_arguments) \
+                $opts_help \
+                "($help -)*:secret:__docker_complete_secrets" && ret=0
+            ;;
+        (help)
+            _arguments $(__docker_arguments) ":subcommand:__docker_secret_commands" && ret=0
+            ;;
+    esac
+
+    return ret
+}
+
+# EO secret
 
 # BO service
 
@@ -1615,6 +1858,7 @@ __docker_service_commands() {
     _docker_service_subcommands=(
         "create:Create a new service"
         "inspect:Display detailed information on one or more services"
+        "logs:Fetch the logs of a service"
         "ls:List services"
         "rm:Remove one or more services"
         "scale:Scale one or multiple replicated services"
@@ -1638,6 +1882,7 @@ __docker_service_subcommand() {
         "($help)--health-interval=[Time between running the check]:time: "
         "($help)--health-retries=[Consecutive failures needed to report unhealthy]:retries:(1 2 3 4 5)"
         "($help)--health-timeout=[Maximum time to allow one check to run]:time: "
+        "($help)--hostname=[Service container hostname]:hostname: " \
         "($help)*--label=[Service labels]:label: "
         "($help)--limit-cpu=[Limit CPUs]:value: "
         "($help)--limit-memory=[Limit Memory]:value: "
@@ -1654,7 +1899,9 @@ __docker_service_subcommand() {
         "($help)--restart-delay=[Delay between restart attempts]:delay: "
         "($help)--restart-max-attempts=[Maximum number of restarts before giving up]:max-attempts: "
         "($help)--restart-window=[Window used to evaluate the restart policy]:window: "
+        "($help)*--secret=[Specify secrets to expose to the service]:secret:__docker_complete_secrets"
         "($help)--stop-grace-period=[Time to wait before force killing a container]:grace period: "
+        "($help -t --tty)"{-t,--tty}"[Allocate a pseudo-TTY]"
         "($help)--update-delay=[Delay between updates]:delay: "
         "($help)--update-failure-action=[Action on update failure]:mode:(pause continue)"
         "($help)--update-max-failure-ratio=[Failure rate to tolerate during an update]:fraction: "
@@ -1671,9 +1918,13 @@ __docker_service_subcommand() {
                 $opts_help \
                 $opts_create_update \
                 "($help)*--container-label=[Container labels]:label: " \
+                "($help)*--dns=[Set custom DNS servers]:DNS: " \
+                "($help)*--dns-option=[Set DNS options]:DNS option: " \
+                "($help)*--dns-search=[Set custom DNS search domains]:DNS search: " \
                 "($help)*--env-file=[Read environment variables from a file]:environment file:_files" \
                 "($help)--mode=[Service Mode]:mode:(global replicated)" \
                 "($help)--name=[Service name]:name: " \
+                "($help)*--publish=[Publish a port]:port: " \
                 "($help -): :__docker_complete_images" \
                 "($help -):command: _command_names -e" \
                 "($help -)*::arguments: _normal" && ret=0
@@ -1684,6 +1935,17 @@ __docker_service_subcommand() {
                 "($help -f --format)"{-f=,--format=}"[Format the output using the given go template]:template: " \
                 "($help)--pretty[Print the information in a human friendly format]" \
                 "($help -)*:service:__docker_complete_services" && ret=0
+            ;;
+        (logs)
+            _arguments $(__docker_arguments) \
+                $opts_help \
+                "($help)--details[Show extra details provided to logs]" \
+                "($help -f --follow)"{-f,--follow}"[Follow log output]" \
+                "($help)--no-resolve[Do not map IDs to Names]" \
+                "($help)--since=[Show logs since timestamp]:timestamp: " \
+                "($help)--tail=[Number of lines to show from the end of the logs]:lines:(1 10 20 50 all)" \
+                "($help -t --timestamps)"{-t,--timestamps}"[Show timestamps]" \
+                "($help -)1:service:__docker_complete_services" && ret=0
             ;;
         (ls|list)
             _arguments $(__docker_arguments) \
@@ -1736,10 +1998,18 @@ __docker_service_subcommand() {
                 "($help)--arg=[Service command args]:arguments: _normal" \
                 "($help)*--container-label-add=[Add or update container labels]:label: " \
                 "($help)*--container-label-rm=[Remove a container label by its key]:label: " \
+                "($help)*--dns-add=[Add or update custom DNS servers]:DNS: " \
+                "($help)*--dns-rm=[Remove custom DNS servers]:DNS: " \
+                "($help)*--dns-option-add=[Add or update DNS options]:DNS option: " \
+                "($help)*--dns-option-rm=[Remove DNS options]:DNS option: " \
+                "($help)*--dns-search-add=[Add or update custom DNS search domains]:DNS search: " \
+                "($help)*--dns-search-rm=[Remove DNS search domains]:DNS search: " \
                 "($help)--force[Force update]" \
                 "($help)*--group-add=[Add additional supplementary user groups to the container]:group:_groups" \
                 "($help)*--group-rm=[Remove previously added supplementary user groups from the container]:group:_groups" \
                 "($help)--image=[Service image tag]:image:__docker_complete_repositories" \
+                "($help)*--publish-add=[Add or update a port]:port: " \
+                "($help)*--publish-rm=[Remove a port(target-port mandatory)]:port: " \
                 "($help)--rollback[Rollback to previous specification]" \
                 "($help -)1:service:__docker_complete_services" && ret=0
             ;;
@@ -1753,6 +2023,147 @@ __docker_service_subcommand() {
 
 # EO service
 
+# BO stack
+
+__docker_stack_complete_ps_filters() {
+    [[ $PREFIX = -* ]] && return 1
+    integer ret=1
+
+    if compset -P '*='; then
+        case "${${words[-1]%=*}#*=}" in
+            (desired-state)
+                state_opts=('accepted' 'running')
+                _describe -t state-opts "desired state options" state_opts && ret=0
+                ;;
+            *)
+                _message 'value' && ret=0
+                ;;
+        esac
+    else
+        opts=('desired-state' 'id' 'name')
+        _describe -t filter-opts "filter options" opts -qS "=" && ret=0
+    fi
+
+    return ret
+}
+
+__docker_stack_complete_services_filters() {
+    [[ $PREFIX = -* ]] && return 1
+    integer ret=1
+
+    if compset -P '*='; then
+        case "${${words[-1]%=*}#*=}" in
+            *)
+                _message 'value' && ret=0
+                ;;
+        esac
+    else
+        opts=('id' 'label' 'name')
+        _describe -t filter-opts "filter options" opts -qS "=" && ret=0
+    fi
+
+    return ret
+}
+
+__docker_stacks() {
+    [[ $PREFIX = -* ]] && return 1
+    integer ret=1
+    local line s
+    declare -a lines stacks
+
+    lines=(${(f)${:-"$(_call_program commands docker $docker_options stack ls)"$'\n'}})
+
+    # Parse header line to find columns
+    local i=1 j=1 k header=${lines[1]}
+    declare -A begin end
+    while (( j < ${#header} - 1 )); do
+        i=$(( j + ${${header[$j,-1]}[(i)[^ ]]} - 1 ))
+        j=$(( i + ${${header[$i,-1]}[(i)  ]} - 1 ))
+        k=$(( j + ${${header[$j,-1]}[(i)[^ ]]} - 2 ))
+        begin[${header[$i,$((j-1))]}]=$i
+        end[${header[$i,$((j-1))]}]=$k
+    done
+    end[${header[$i,$((j-1))]}]=-1
+    lines=(${lines[2,-1]})
+
+    # Service ID
+    for line in $lines; do
+        s="${line[${begin[ID]},${end[ID]}]%% ##}"
+        stacks=($stacks $s)
+    done
+
+    _describe -t stacks-list "stacks" stacks "$@" && ret=0
+    return ret
+}
+
+__docker_complete_stacks() {
+    [[ $PREFIX = -* ]] && return 1
+    __docker_stacks "$@"
+}
+
+__docker_stack_commands() {
+    local -a _docker_stack_subcommands
+    _docker_stack_subcommands=(
+        "deploy:Deploy a new stack or update an existing stack"
+        "ls:List stacks"
+        "ps:List the tasks in the stack"
+        "rm:Remove the stack"
+        "services:List the services in the stack"
+    )
+    _describe -t docker-stack-commands "docker stack command" _docker_stack_subcommands
+}
+
+__docker_stack_subcommand() {
+    local -a _command_args opts_help
+    local expl help="--help"
+    integer ret=1
+
+    opts_help=("(: -)--help[Print usage]")
+
+    case "$words[1]" in
+        (deploy|up)
+            _arguments $(__docker_arguments) \
+                $opts_help \
+                "($help)--bundle-file=[Path to a Distributed Application Bundle file]:dab:_files -g \"*.dab\"" \
+                "($help -c --compose-file)"{-c=,--compose-file=}"[Path to a Compose file]:compose file:_files -g \"*.(yml|yaml)\"" \
+                "($help)--with-registry-auth[Send registry authentication details to Swarm agents]" \
+                "($help -):stack:__docker_complete_stacks" && ret=0
+            ;;
+        (ls|list)
+            _arguments $(__docker_arguments) \
+                $opts_help && ret=0
+            ;;
+        (ps)
+            _arguments $(__docker_arguments) \
+                $opts_help \
+                "($help -a --all)"{-a,--all}"[Display all tasks]" \
+                "($help)*"{-f=,--filter=}"[Filter output based on conditions provided]:filter:__docker_stack_complete_ps_filters" \
+                "($help)--no-resolve[Do not map IDs to Names]" \
+                "($help)--no-trunc[Do not truncate output]" \
+                "($help -):stack:__docker_complete_stacks" && ret=0
+            ;;
+        (rm|remove|down)
+            _arguments $(__docker_arguments) \
+                $opts_help \
+                "($help -):stack:__docker_complete_stacks" && ret=0
+            ;;
+        (services)
+            _arguments $(__docker_arguments) \
+                $opts_help \
+                "($help)*"{-f=,--filter=}"[Filter output based on conditions provided]:filter:__docker_stack_complete_services_filters" \
+                "($help -q --quiet)"{-q,--quiet}"[Only display IDs]" \
+                "($help -):stack:__docker_complete_stacks" && ret=0
+            ;;
+        (help)
+            _arguments $(__docker_arguments) ":subcommand:__docker_stack_commands" && ret=0
+            ;;
+    esac
+
+    return ret
+}
+
+# EO stack
+
 # BO swarm
 
 __docker_swarm_commands() {
@@ -1762,6 +2173,8 @@ __docker_swarm_commands() {
         "join:Join a swarm as a node and/or manager"
         "join-token:Manage join tokens"
         "leave:Leave a swarm"
+        "unlock:Unlock swarm"
+        "unlock-key:Manage the unlock key"
         "update:Update the swarm"
     )
     _describe -t docker-swarm-commands "docker swarm command" _docker_swarm_subcommands
@@ -1778,7 +2191,11 @@ __docker_swarm_subcommand() {
         (init)
             _arguments $(__docker_arguments) \
                 $opts_help \
-                "($help)--advertise-addr[Advertised address]:ip\:port: " \
+                "($help)--advertise-addr=[Advertised address]:ip\:port: " \
+                "($help)--autolock[Enable manager autolocking]" \
+                "($help)--availability=[Availability of the node]:availability:(active drain pause)" \
+                "($help)--cert-expiry=[Validity period for node certificates]:duration: " \
+                "($help)--dispatcher-heartbeat=[Dispatcher heartbeat period]:duration: " \
                 "($help)*--external-ca=[Specifications of one or more certificate signing endpoints]:endpoint: " \
                 "($help)--force-new-cluster[Force create a new cluster from current state]" \
                 "($help)--listen-addr=[Listen address]:ip\:port: " \
@@ -1787,9 +2204,10 @@ __docker_swarm_subcommand() {
                 "($help)--task-history-limit=[Task history retention limit]:limit: " && ret=0
             ;;
         (join)
-            _arguments $(__docker_arguments) \
+            _arguments $(__docker_arguments) -A '-*' \
                 $opts_help \
-                "($help)--advertise-addr[Advertised address]:ip\:port: " \
+                "($help)--advertise-addr=[Advertised address]:ip\:port: " \
+                "($help)--availability=[Availability of the node]:availability:(active drain pause)" \
                 "($help)--listen-addr=[Listen address]:ip\:port: " \
                 "($help)--token=[Token for entry into the swarm]:secret: " \
                 "($help -):host\:port: " && ret=0
@@ -1803,14 +2221,26 @@ __docker_swarm_subcommand() {
             ;;
         (leave)
             _arguments $(__docker_arguments) \
+                $opts_help \
+                "($help -f --force)"{-f,--force}"[Force this node to leave the swarm, ignoring warnings]" && ret=0
+            ;;
+        (unlock)
+            _arguments $(__docker_arguments) \
                 $opts_help && ret=0
+            ;;
+        (unlock-key)
+            _arguments $(__docker_arguments) \
+                $opts_help \
+                "($help -q --quiet)"{-q,--quiet}"[Only display token]" \
+                "($help)--rotate[Rotate unlock token]" && ret=0
             ;;
         (update)
             _arguments $(__docker_arguments) \
                 $opts_help \
+                "($help)--autolock[Enable manager autolocking]" \
                 "($help)--cert-expiry=[Validity period for node certificates]:duration: " \
-                "($help)*--external-ca=[Specifications of one or more certificate signing endpoints]:endpoint: " \
                 "($help)--dispatcher-heartbeat=[Dispatcher heartbeat period]:duration: " \
+                "($help)*--external-ca=[Specifications of one or more certificate signing endpoints]:endpoint: " \
                 "($help)--max-snapshots[Number of additional Raft snapshots to retain]" \
                 "($help)--snapshot-interval[Number of log entries between Raft snapshots]" \
                 "($help)--task-history-limit=[Task history retention limit]:limit: " && ret=0
@@ -1824,6 +2254,62 @@ __docker_swarm_subcommand() {
 }
 
 # EO swarm
+
+# BO system
+
+__docker_system_commands() {
+    local -a _docker_system_subcommands
+    _docker_system_subcommands=(
+        "df:Show docker filesystem usage"
+        "events:Get real time events from the server"
+        "info:Display system-wide information"
+        "prune:Remove unused data"
+    )
+    _describe -t docker-system-commands "docker system command" _docker_system_subcommands
+}
+
+__docker_system_subcommand() {
+    local -a _command_args opts_help
+    local expl help="--help"
+    integer ret=1
+
+    opts_help=("(: -)--help[Print usage]")
+
+    case "$words[1]" in
+        (df)
+            _arguments $(__docker_arguments) \
+                $opts_help \
+                "($help -v --verbose)"{-v,--verbose}"[Show detailed information on space usage]" && ret=0
+            ;;
+        (events)
+            _arguments $(__docker_arguments) \
+                $opts_help \
+                "($help)*"{-f=,--filter=}"[Filter values]:filter:__docker_complete_events_filter" \
+                "($help)--since=[Events created since this timestamp]:timestamp: " \
+                "($help)--until=[Events created until this timestamp]:timestamp: " \
+                "($help)--format=[Format the output using the given go template]:template: " && ret=0
+            ;;
+        (info)
+            _arguments $(__docker_arguments) \
+                $opts_help \
+                "($help -f --format)"{-f=,--format=}"[Format the output using the given go template]:template: " && ret=0
+            ;;
+        (prune)
+            _arguments $(__docker_arguments) \
+                $opts_help \
+                "($help -a --all)"{-a,--all}"[Remove all unused data, not just dangling ones]" \
+                "($help)*--filter=[Filter values]:filter:__docker_complete_prune_filters" \
+                "($help -f --force)"{-f,--force}"[Do not prompt for confirmation]" && ret=0
+            ;;
+        (help)
+            _arguments $(__docker_arguments) ":subcommand:__docker_volume_commands" && ret=0
+            ;;
+    esac
+
+    return ret
+}
+
+# EO system
 
 # BO volume
 
@@ -1841,7 +2327,7 @@ __docker_volume_complete_ls_filters() {
                 __docker_complete_info_plugins Volume && ret=0
                 ;;
             (name)
-                __docker_volumes && ret=0
+                __docker_complete_volumes && ret=0
                 ;;
             *)
                 _message 'value' && ret=0
@@ -1855,7 +2341,7 @@ __docker_volume_complete_ls_filters() {
     return ret
 }
 
-__docker_volumes() {
+__docker_complete_volumes() {
     [[ $PREFIX = -* ]] && return 1
     integer ret=1
     declare -a lines volumes
@@ -1893,6 +2379,7 @@ __docker_volume_commands() {
         "create:Create a volume"
         "inspect:Display detailed information on one or more volumes"
         "ls:List volumes"
+        "prune:Remove all unused volumes"
         "rm:Remove one or more volumes"
     )
     _describe -t docker-volume-commands "docker volume command" _docker_volume_subcommands
@@ -1918,7 +2405,7 @@ __docker_volume_subcommand() {
             _arguments $(__docker_arguments) \
                 $opts_help \
                 "($help -f --format)"{-f=,--format=}"[Format the output using the given go template]:template: " \
-                "($help -)1:volume:__docker_volumes" && ret=0
+                "($help -)1:volume:__docker_complete_volumes" && ret=0
             ;;
         (ls)
             _arguments $(__docker_arguments) \
@@ -1932,11 +2419,16 @@ __docker_volume_subcommand() {
                     ;;
             esac
             ;;
+        (prune)
+            _arguments $(__docker_arguments) \
+                $opts_help \
+                "($help -f --force)"{-f,--force}"[Do not prompt for confirmation]" && ret=0
+            ;;
         (rm)
             _arguments $(__docker_arguments) \
                 $opts_help \
                 "($help -f --force)"{-f,--force}"[Force the removal of one or more volumes]" \
-                "($help -):volume:__docker_volumes" && ret=0
+                "($help -):volume:__docker_complete_volumes" && ret=0
             ;;
         (help)
             _arguments $(__docker_arguments) ":subcommand:__docker_volume_commands" && ret=0
@@ -1987,6 +2479,23 @@ __docker_subcommand() {
         (build|history|import|load|pull|push|save|tag)
             __docker_image_subcommand && ret=0
             ;;
+        (checkpoint)
+            local curcontext="$curcontext" state
+            _arguments $(__docker_arguments) \
+                $opts_help \
+                "($help -): :->command" \
+                "($help -)*:: :->option-or-argument" && ret=0
+
+            case $state in
+                (command)
+                    __docker_checkpoint_commands && ret=0
+                    ;;
+                (option-or-argument)
+                    curcontext=${curcontext%:*:*}:docker-${words[-1]}:
+                    __docker_checkpoint_subcommand && ret=0
+                    ;;
+            esac
+            ;;
         (container)
             local curcontext="$curcontext" state
             _arguments $(__docker_arguments) \
@@ -2008,7 +2517,7 @@ __docker_subcommand() {
             _arguments $(__docker_arguments) \
                 $opts_help \
                 "($help)*--add-runtime=[Register an additional OCI compatible runtime]:runtime:__docker_complete_runtimes" \
-                "($help)--api-cors-header=[CORS headers in the remote API]:CORS headers: " \
+                "($help)--api-cors-header=[CORS headers in the Engine API]:CORS headers: " \
                 "($help)*--authorization-plugin=[Authorization plugins to load]" \
                 "($help -b --bridge)"{-b=,--bridge=}"[Attach containers to a network bridge]:bridge:_net_interfaces" \
                 "($help)--bip=[Network bridge IP]:IP address: " \
@@ -2035,6 +2544,7 @@ __docker_subcommand() {
                 "($help -g --graph)"{-g=,--graph=}"[Root of the Docker runtime]:path:_directories" \
                 "($help -H --host)"{-H=,--host=}"[tcp://host:port to bind/connect to]:host: " \
                 "($help)--icc[Enable inter-container communication]" \
+                "($help)--init[Run an init inside containers to forward signals and reap processes]" \
                 "($help)--init-path=[Path to the docker-init binary]:docker-init binary:_files" \
                 "($help)*--insecure-registry=[Enable insecure registry communication]:registry: " \
                 "($help)--ip=[Default IP when binding container ports]" \
@@ -2054,6 +2564,7 @@ __docker_subcommand() {
                 "($help -p --pidfile)"{-p=,--pidfile=}"[Path to use for daemon PID file]:PID file:_files" \
                 "($help)--raw-logs[Full timestamps without ANSI coloring]" \
                 "($help)*--registry-mirror=[Preferred Docker registry mirror]:registry mirror: " \
+                "($help)--seccomp-profile=[Path to seccomp profile]:path:_files -g \"*.json\"" \
                 "($help -s --storage-driver)"{-s=,--storage-driver=}"[Storage driver to use]:driver:(aufs btrfs devicemapper overlay overlay2 vfs zfs)" \
                 "($help)--selinux-enabled[Enable selinux support]" \
                 "($help)--shutdown-timeout=[Set the shutdown timeout value in seconds]:time: " \
@@ -2064,7 +2575,8 @@ __docker_subcommand() {
                 "($help)--tlskey=[Path to TLS key file]:Key file:_files -g \"*.(pem|key)\"" \
                 "($help)--tlsverify[Use TLS and verify the remote]" \
                 "($help)--userns-remap=[User/Group setting for user namespaces]:user\:group:->users-groups" \
-                "($help)--userland-proxy[Use userland proxy for loopback traffic]" && ret=0
+                "($help)--userland-proxy[Use userland proxy for loopback traffic]" \
+                "($help)--userland-proxy-path=[Path to the userland proxy binary]:binary:_files" && ret=0
 
             case $state in
                 (cluster-store)
@@ -2093,13 +2605,8 @@ __docker_subcommand() {
                     ;;
             esac
             ;;
-        (events)
-            _arguments $(__docker_arguments) \
-                $opts_help \
-                "($help)*"{-f=,--filter=}"[Filter values]:filter:__docker_complete_events_filter" \
-                "($help)--since=[Events created since this timestamp]:timestamp: " \
-                "($help)--until=[Events created until this timestamp]:timestamp: " \
-                "($help)--format=[Format the output using the given go template]:template: " && ret=0
+        (events|info)
+            __docker_system_subcommand && ret=0
             ;;
         (image)
             local curcontext="$curcontext" state
@@ -2122,18 +2629,13 @@ __docker_subcommand() {
             words[1]='ls'
             __docker_image_subcommand && ret=0
             ;;
-        (info|version)
-            _arguments $(__docker_arguments) \
-                $opts_help \
-                "($help -f --format)"{-f=,--format=}"[Format the output using the given go template]:template: " && ret=0
-            ;;
         (inspect)
             local state
             _arguments $(__docker_arguments) \
                 $opts_help \
                 "($help -f --format)"{-f=,--format=}"[Format the output using the given go template]:template: " \
                 "($help -s --size)"{-s,--size}"[Display total file sizes if the type is container]" \
-                "($help)--type=[Return JSON for specified type]:type:(image container)" \
+                "($help)--type=[Return JSON for specified type]:type:(container image network node plugin service volume)" \
                 "($help -)*: :->values" && ret=0
 
             case $state in
@@ -2142,21 +2644,37 @@ __docker_subcommand() {
                         __docker_complete_containers && ret=0
                     elif [[ ${words[(r)--type=image]} == --type=image ]]; then
                         __docker_complete_images && ret=0
+                    elif [[ ${words[(r)--type=network]} == --type=network ]]; then
+                        __docker_complete_networks && ret=0
+                    elif [[ ${words[(r)--type=node]} == --type=node ]]; then
+                        __docker_complete_nodes && ret=0
+                    elif [[ ${words[(r)--type=plugin]} == --type=plugin ]]; then
+                        __docker_complete_plugins && ret=0
+                    elif [[ ${words[(r)--type=service]} == --type=service ]]; then
+                        __docker_complete_services && ret=0
+                    elif [[ ${words[(r)--type=volume]} == --type=volume ]]; then
+                        __docker_complete_volumes && ret=0
                     else
-                        __docker_complete_images && __docker_complete_containers && ret=0
+                        __docker_complete_containers
+                        __docker_complete_images
+                        __docker_complete_networks
+                        __docker_complete_nodes
+                        __docker_complete_plugins
+                        __docker_complete_services
+                        __docker_complete_volumes && ret=0
                     fi
                     ;;
             esac
             ;;
         (login)
-            _arguments $(__docker_arguments) \
+            _arguments $(__docker_arguments) -A '-*' \
                 $opts_help \
                 "($help -p --password)"{-p=,--password=}"[Password]:password: " \
                 "($help -u --user)"{-u=,--user=}"[Username]:username: " \
                 "($help -)1:server: " && ret=0
             ;;
         (logout)
-            _arguments $(__docker_arguments) \
+            _arguments $(__docker_arguments) -A '-*' \
                 $opts_help \
                 "($help -)1:server: " && ret=0
             ;;
@@ -2220,7 +2738,7 @@ __docker_subcommand() {
             __docker_image_subcommand && ret=0
             ;;
         (search)
-            _arguments $(__docker_arguments) \
+            _arguments $(__docker_arguments) -A '-*' \
                 $opts_help \
                 "($help)*"{-f=,--filter=}"[Filter values]:filter:->filter-options" \
                 "($help)--limit=[Maximum returned search results]:limit:(1 5 10 25 50)" \
@@ -2230,6 +2748,23 @@ __docker_subcommand() {
             case $state in
                 (filter-options)
                     __docker_complete_search_filters && ret=0
+                    ;;
+            esac
+            ;;
+        (secret)
+            local curcontext="$curcontext" state
+            _arguments $(__docker_arguments) \
+                $opts_help \
+                "($help -): :->command" \
+                "($help -)*:: :->option-or-argument" && ret=0
+
+            case $state in
+                (command)
+                    __docker_secret_commands && ret=0
+                    ;;
+                (option-or-argument)
+                    curcontext=${curcontext%:*:*}:docker-${words[-1]}:
+                    __docker_secret_subcommand && ret=0
                     ;;
             esac
             ;;
@@ -2250,6 +2785,23 @@ __docker_subcommand() {
                     ;;
             esac
             ;;
+        (stack)
+            local curcontext="$curcontext" state
+            _arguments $(__docker_arguments) \
+                $opts_help \
+                "($help -): :->command" \
+                "($help -)*:: :->option-or-argument" && ret=0
+
+            case $state in
+                (command)
+                    __docker_stack_commands && ret=0
+                    ;;
+                (option-or-argument)
+                    curcontext=${curcontext%:*:*}:docker-${words[-1]}:
+                    __docker_stack_subcommand && ret=0
+                    ;;
+            esac
+            ;;
         (swarm)
             local curcontext="$curcontext" state
             _arguments $(__docker_arguments) \
@@ -2266,6 +2818,28 @@ __docker_subcommand() {
                     __docker_swarm_subcommand && ret=0
                     ;;
             esac
+            ;;
+        (system)
+            local curcontext="$curcontext" state
+            _arguments $(__docker_arguments) \
+                $opts_help \
+                "($help -): :->command" \
+                "($help -)*:: :->option-or-argument" && ret=0
+
+            case $state in
+                (command)
+                    __docker_system_commands && ret=0
+                    ;;
+                (option-or-argument)
+                    curcontext=${curcontext%:*:*}:docker-${words[-1]}:
+                    __docker_system_subcommand && ret=0
+                    ;;
+            esac
+            ;;
+        (version)
+            _arguments $(__docker_arguments) \
+                $opts_help \
+                "($help -f --format)"{-f=,--format=}"[Format the output using the given go template]:template: " && ret=0
             ;;
         (volume)
             local curcontext="$curcontext" state

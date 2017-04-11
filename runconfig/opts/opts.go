@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"runtime"
 	"strings"
 
 	fopts "github.com/docker/docker/opts"
@@ -45,26 +46,17 @@ func ValidateEnv(val string) (string, error) {
 func doesEnvExist(name string) bool {
 	for _, entry := range os.Environ() {
 		parts := strings.SplitN(entry, "=", 2)
+		if runtime.GOOS == "windows" {
+			// Environment variable are case-insensitive on Windows. PaTh, path and PATH are equivalent.
+			if strings.EqualFold(parts[0], name) {
+				return true
+			}
+		}
 		if parts[0] == name {
 			return true
 		}
 	}
 	return false
-}
-
-// ValidateArg validates a build-arg variable and returns it.
-// Build-arg is in the form of <varname>=<value> where <varname> is required.
-func ValidateArg(val string) (string, error) {
-	arr := strings.Split(val, "=")
-	if len(arr) > 1 && isNotEmpty(arr[0]) {
-		return val, nil
-	}
-
-	return "", fmt.Errorf("bad format for build-arg: %s", val)
-}
-
-func isNotEmpty(val string) bool {
-	return len(val) > 0
 }
 
 // ValidateExtraHost validates that the specified string is a valid extrahost and returns it.

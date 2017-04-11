@@ -531,6 +531,10 @@ func (s *DockerSuite) TestBuildCacheAdd(c *check.C) {
 }
 
 func (s *DockerSuite) TestBuildLastModified(c *check.C) {
+	// Temporary fix for #30890. TODO @jhowardmsft figure out what
+	// has changed in the master busybox image.
+	testRequires(c, DaemonIsLinux)
+
 	name := "testbuildlastmodified"
 
 	server, err := fakeStorage(map[string]string{
@@ -1865,6 +1869,10 @@ func (s *DockerSuite) TestBuildWindowsWorkdirProcessing(c *check.C) {
 func (s *DockerSuite) TestBuildWindowsAddCopyPathProcessing(c *check.C) {
 	testRequires(c, DaemonIsWindows)
 	name := "testbuildwindowsaddcopypathprocessing"
+	// TODO Windows (@jhowardmsft). Needs a follow-up PR to 22181 to
+	// support backslash such as .\\ being equivalent to ./ and c:\\ being
+	// equivalent to c:/. This is not currently (nor ever has been) supported
+	// by docker on the Windows platform.
 	dockerfile := `
 		FROM busybox
 			# No trailing slash on COPY/ADD
@@ -3606,8 +3614,8 @@ RUN [ "$(id -u):$(id -g)/$(id -un):$(id -gn)/$(id -G):$(id -Gn)" = '1001:1001/do
 
 # Switch back to root and double check that worked exactly as we might expect it to
 USER root
-# Add a "supplementary" group for our dockerio user
 RUN [ "$(id -u):$(id -g)/$(id -un):$(id -gn)/$(id -G):$(id -Gn)" = '0:0/root:root/0 10:root wheel' ] && \
+        # Add a "supplementary" group for our dockerio user
 	echo 'supplementary:x:1002:dockerio' >> /etc/group
 
 # ... and then go verify that we get it like we expect
@@ -3643,6 +3651,7 @@ RUN [ "$(id -u):$(id -g)/$(id -un):$(id -gn)/$(id -G):$(id -Gn)" = '1042:1043/10
 	}
 }
 
+// FIXME(vdemeester) rename this test (and probably "merge" it with the one below TestBuildEnvUsage2)
 func (s *DockerSuite) TestBuildEnvUsage(c *check.C) {
 	// /docker/world/hello is not owned by the correct user
 	testRequires(c, NotUserNamespace)
@@ -3681,6 +3690,7 @@ RUN    [ "$ghi" = "def" ]
 	}
 }
 
+// FIXME(vdemeester) rename this test (and probably "merge" it with the one above TestBuildEnvUsage)
 func (s *DockerSuite) TestBuildEnvUsage2(c *check.C) {
 	// /docker/world/hello is not owned by the correct user
 	testRequires(c, NotUserNamespace)
@@ -4807,6 +4817,7 @@ CMD cat /foo/file`,
 
 }
 
+// FIXME(vdemeester) part of this should be unit test, other part should be clearer
 func (s *DockerSuite) TestBuildRenamedDockerfile(c *check.C) {
 
 	ctx, err := fakeContext(`FROM busybox
@@ -6066,6 +6077,71 @@ func (s *DockerSuite) TestBuildBuildTimeArgUnconsumedArg(c *check.C) {
 
 }
 
+func (s *DockerSuite) TestBuildBuildTimeArgEnv(c *check.C) {
+	testRequires(c, DaemonIsLinux) // Windows does not support ARG
+	args := []string{
+		"build",
+		"--build-arg", fmt.Sprintf("FOO1=fromcmd"),
+		"--build-arg", fmt.Sprintf("FOO2="),
+		"--build-arg", fmt.Sprintf("FOO3"), // set in env
+		"--build-arg", fmt.Sprintf("FOO4"), // not set in env
+		"--build-arg", fmt.Sprintf("FOO5=fromcmd"),
+		// FOO6 is not set at all
+		"--build-arg", fmt.Sprintf("FOO7=fromcmd"), // should produce a warning
+		"--build-arg", fmt.Sprintf("FOO8="), // should produce a warning
+		"--build-arg", fmt.Sprintf("FOO9"), // should produce a warning
+		".",
+	}
+
+	dockerfile := fmt.Sprintf(`FROM busybox
+		ARG FOO1=fromfile
+		ARG FOO2=fromfile
+		ARG FOO3=fromfile
+		ARG FOO4=fromfile
+		ARG FOO5
+		ARG FOO6
+		RUN env
+		RUN [ "$FOO1" == "fromcmd" ]
+		RUN [ "$FOO2" == "" ]
+		RUN [ "$FOO3" == "fromenv" ]
+		RUN [ "$FOO4" == "fromfile" ]
+		RUN [ "$FOO5" == "fromcmd" ]
+		# The following should not exist at all in the env
+		RUN [ "$(env | grep FOO6)" == "" ]
+		RUN [ "$(env | grep FOO7)" == "" ]
+		RUN [ "$(env | grep FOO8)" == "" ]
+		RUN [ "$(env | grep FOO9)" == "" ]
+	    `)
+
+	ctx, err := fakeContext(dockerfile, nil)
+	c.Assert(err, check.IsNil)
+	defer ctx.Close()
+
+	cmd := exec.Command(dockerBinary, args...)
+	cmd.Dir = ctx.Dir
+	cmd.Env = append(os.Environ(),
+		"FOO1=fromenv",
+		"FOO2=fromenv",
+		"FOO3=fromenv")
+	out, _, err := runCommandWithOutput(cmd)
+	if err != nil {
+		c.Fatal(err, out)
+	}
+
+	// Now check to make sure we got a warning msg about unused build-args
+	i := strings.Index(out, "[Warning]")
+	if i < 0 {
+		c.Fatalf("Missing the build-arg warning in %q", out)
+	}
+
+	out = out[i:] // "out" should contain just the warning message now
+
+	// These were specified on a --build-arg but no ARG was in the Dockerfile
+	c.Assert(out, checker.Contains, "FOO7")
+	c.Assert(out, checker.Contains, "FOO8")
+	c.Assert(out, checker.Contains, "FOO9")
+}
+
 func (s *DockerSuite) TestBuildBuildTimeArgQuotedValVariants(c *check.C) {
 	imgName := "bldargtest"
 	envKey := "foo"
@@ -6974,17 +7050,6 @@ func (s *DockerSuite) TestBuildCmdShellArgsEscaped(c *check.C) {
 	}
 }
 
-func (s *DockerSuite) TestContinueCharSpace(c *check.C) {
-	// Test to make sure that we don't treat a \ as a continuation
-	// character IF there are spaces (or tabs) after it on the same line
-	name := "testbuildcont"
-	_, err := buildImage(name, "FROM busybox\nRUN echo hi \\\t\nbye", true)
-	c.Assert(err, check.NotNil, check.Commentf("Build 1 should fail - didn't"))
-
-	_, err = buildImage(name, "FROM busybox\nRUN echo hi \\ \nbye", true)
-	c.Assert(err, check.NotNil, check.Commentf("Build 2 should fail - didn't"))
-}
-
 // Test case for #24912.
 func (s *DockerSuite) TestBuildStepsWithProgress(c *check.C) {
 	name := "testbuildstepswithprogress"
@@ -7137,66 +7202,6 @@ func (s *DockerSuite) TestBuildNetContainer(c *check.C) {
 	c.Assert(strings.TrimSpace(host), check.Equals, "foobar")
 }
 
-// Test case for #24693
-func (s *DockerSuite) TestBuildRunEmptyLineAfterEscape(c *check.C) {
-	name := "testbuildemptylineafterescape"
-	_, out, err := buildImageWithOut(name,
-		`
-FROM busybox
-RUN echo x \
-
-RUN echo y
-RUN echo z
-# Comment requires the '#' to start from position 1
-# RUN echo w
-`, true)
-	c.Assert(err, checker.IsNil)
-	c.Assert(out, checker.Contains, "Step 1/4 : FROM busybox")
-	c.Assert(out, checker.Contains, "Step 2/4 : RUN echo x")
-	c.Assert(out, checker.Contains, "Step 3/4 : RUN echo y")
-	c.Assert(out, checker.Contains, "Step 4/4 : RUN echo z")
-
-	// With comment, see #24693
-	name = "testbuildcommentandemptylineafterescape"
-	_, out, err = buildImageWithOut(name,
-		`
-FROM busybox
-RUN echo grafana && \
-    echo raintank \
-#echo env-load
-RUN echo vegeta
-`, true)
-	c.Assert(err, checker.IsNil)
-	c.Assert(out, checker.Contains, "Step 1/3 : FROM busybox")
-	c.Assert(out, checker.Contains, "Step 2/3 : RUN echo grafana &&     echo raintank")
-	c.Assert(out, checker.Contains, "Step 3/3 : RUN echo vegeta")
-}
-
-// Verifies if COPY file . when WORKDIR is set to a non-existing directory,
-// the directory is created and the file is copied into the directory,
-// as opposed to the file being copied as a file with the name of the
-// directory. Fix for 27545 (found on Windows, but regression good for Linux too)
-func (s *DockerSuite) TestBuildCopyFileDotWithWorkdir(c *check.C) {
-	name := "testbuildcopyfiledotwithworkdir"
-
-	ctx, err := fakeContext(`FROM busybox
-WORKDIR /foo
-COPY file .
-RUN ["cat", "/foo/file"]
-`,
-		map[string]string{})
-	if err != nil {
-		c.Fatal(err)
-	}
-	defer ctx.Close()
-	if err := ctx.Add("file", "content"); err != nil {
-		c.Fatal(err)
-	}
-	if _, err = buildImageFromContext(name, ctx, true); err != nil {
-		c.Fatal(err)
-	}
-}
-
 func (s *DockerSuite) TestBuildSquashParent(c *check.C) {
 	testRequires(c, ExperimentalDaemon)
 	dockerFile := `
@@ -7286,4 +7291,109 @@ func (s *DockerSuite) TestBuildOpaqueDirectory(c *check.C) {
 	// was not handled correctly
 	_, err := buildImage("testopaquedirectory", dockerFile, false)
 	c.Assert(err, checker.IsNil)
+}
+
+// Windows test for USER in dockerfile
+func (s *DockerSuite) TestBuildWindowsUser(c *check.C) {
+	testRequires(c, DaemonIsWindows)
+	name := "testbuildwindowsuser"
+	_, out, err := buildImageWithOut(name,
+		`FROM `+WindowsBaseImage+`
+		RUN net user user /add
+		USER user
+		RUN set username
+		`,
+		true)
+	if err != nil {
+		c.Fatal(err)
+	}
+	c.Assert(strings.ToLower(out), checker.Contains, "username=user")
+}
+
+// Verifies if COPY file . when WORKDIR is set to a non-existing directory,
+// the directory is created and the file is copied into the directory,
+// as opposed to the file being copied as a file with the name of the
+// directory. Fix for 27545 (found on Windows, but regression good for Linux too).
+// Note 27545 was reverted in 28505, but a new fix was added subsequently in 28514.
+func (s *DockerSuite) TestBuildCopyFileDotWithWorkdir(c *check.C) {
+	name := "testbuildcopyfiledotwithworkdir"
+	ctx, err := fakeContext(`FROM busybox 
+WORKDIR /foo 
+COPY file . 
+RUN ["cat", "/foo/file"] 
+`,
+		map[string]string{})
+
+	if err != nil {
+		c.Fatal(err)
+	}
+	defer ctx.Close()
+
+	if err := ctx.Add("file", "content"); err != nil {
+		c.Fatal(err)
+	}
+
+	if _, err = buildImageFromContext(name, ctx, true); err != nil {
+		c.Fatal(err)
+	}
+}
+
+// Case-insensitive environment variables on Windows
+func (s *DockerSuite) TestBuildWindowsEnvCaseInsensitive(c *check.C) {
+	testRequires(c, DaemonIsWindows)
+	name := "testbuildwindowsenvcaseinsensitive"
+	if _, err := buildImage(name, `
+		FROM `+WindowsBaseImage+`
+		ENV FOO=bar foo=bar
+  `, true); err != nil {
+		c.Fatal(err)
+	}
+	res := inspectFieldJSON(c, name, "Config.Env")
+	if res != `["foo=bar"]` { // Should not have FOO=bar in it - takes the last one processed. And only one entry as deduped.
+		c.Fatalf("Case insensitive environment variables on Windows failed. Got %s", res)
+	}
+}
+
+// Test case for 29667
+func (s *DockerSuite) TestBuildWorkdirImageCmd(c *check.C) {
+	testRequires(c, DaemonIsLinux)
+
+	image := "testworkdirimagecmd"
+	dockerfile := `
+FROM busybox
+WORKDIR /foo/bar
+`
+	out, err := buildImage(image, dockerfile, true)
+	c.Assert(err, checker.IsNil, check.Commentf("Output: %s", out))
+
+	out, _ = dockerCmd(c, "inspect", "--format", "{{ json .Config.Cmd }}", image)
+	c.Assert(strings.TrimSpace(out), checker.Equals, `["sh"]`)
+
+	image = "testworkdirlabelimagecmd"
+	dockerfile = `
+FROM busybox
+WORKDIR /foo/bar
+LABEL a=b
+`
+	out, err = buildImage(image, dockerfile, true)
+	c.Assert(err, checker.IsNil, check.Commentf("Output: %s", out))
+
+	out, _ = dockerCmd(c, "inspect", "--format", "{{ json .Config.Cmd }}", image)
+	c.Assert(strings.TrimSpace(out), checker.Equals, `["sh"]`)
+}
+
+// Test case for 28902/28090
+func (s *DockerSuite) TestBuildWorkdirCmd(c *check.C) {
+	testRequires(c, DaemonIsLinux)
+
+	dockerFile := `
+                FROM golang:1.7-alpine
+                WORKDIR /
+                `
+	_, err := buildImage("testbuildworkdircmd", dockerFile, true)
+	c.Assert(err, checker.IsNil)
+
+	_, out, err := buildImageWithOut("testbuildworkdircmd", dockerFile, true)
+	c.Assert(err, checker.IsNil)
+	c.Assert(strings.Count(out, "Using cache"), checker.Equals, 1)
 }

@@ -104,7 +104,6 @@ func (s *DockerSuite) TestCommitWithHostBindMount(c *check.C) {
 }
 
 func (s *DockerSuite) TestCommitChange(c *check.C) {
-	testRequires(c, DaemonIsLinux)
 	dockerCmd(c, "run", "--name", "test", "busybox", "true")
 
 	imageID, _ := dockerCmd(c, "commit",
@@ -122,12 +121,14 @@ func (s *DockerSuite) TestCommitChange(c *check.C) {
 		"test", "test-commit")
 	imageID = strings.TrimSpace(imageID)
 
+	prefix, slash := getPrefixAndSlashFromDaemonPlatform()
+	prefix = strings.ToUpper(prefix) // Force C: as that's how WORKDIR is normalised on Windows
 	expected := map[string]string{
 		"Config.ExposedPorts": "map[8080/tcp:{}]",
 		"Config.Env":          "[DEBUG=true test=1 PATH=/foo]",
 		"Config.Labels":       "map[foo:bar]",
 		"Config.Cmd":          "[/bin/sh]",
-		"Config.WorkingDir":   "/opt",
+		"Config.WorkingDir":   prefix + slash + "opt",
 		"Config.Entrypoint":   "[/bin/sh]",
 		"Config.User":         "testuser",
 		"Config.Volumes":      "map[/var/lib/docker:{}]",
@@ -140,4 +141,17 @@ func (s *DockerSuite) TestCommitChange(c *check.C) {
 			c.Errorf("%s('%s'), expected %s", conf, res, value)
 		}
 	}
+}
+
+func (s *DockerSuite) TestCommitChangeLabels(c *check.C) {
+	dockerCmd(c, "run", "--name", "test", "--label", "some=label", "busybox", "true")
+
+	imageID, _ := dockerCmd(c, "commit",
+		"--change", "LABEL some=label2",
+		"test", "test-commit")
+	imageID = strings.TrimSpace(imageID)
+
+	c.Assert(inspectField(c, imageID, "Config.Labels"), checker.Equals, "map[some:label2]")
+	// check that container labels didn't change
+	c.Assert(inspectField(c, "test", "Config.Labels"), checker.Equals, "map[some:label]")
 }

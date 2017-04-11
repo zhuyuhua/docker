@@ -38,8 +38,7 @@ Options:
       --label value             Set metadata for an image (default [])
   -m, --memory string           Memory limit
       --memory-swap string      Swap limit equal to memory plus swap: '-1' to enable unlimited swap
-      --network string          Set the networking mode for the run commands
-                                during build.
+      --network string          Set the networking mode for the RUN instructions during build
                                 'bridge': use default Docker bridge
                                 'none': no networking
                                 'container:<name|id>': reuse another container's network stack
@@ -54,10 +53,12 @@ Options:
                                 The format is `<number><unit>`. `number` must be greater than `0`.
                                 Unit is optional and can be `b` (bytes), `k` (kilobytes), `m` (megabytes),
                                 or `g` (gigabytes). If you omit the unit, the system uses bytes.
-  --squash                      Squash newly built layers into a single new layer (**Experimental Only**) 
+      --squash                  Squash newly built layers into a single new layer (**Experimental Only**)
   -t, --tag value               Name and optionally a tag in the 'name:tag' format (default [])
       --ulimit value            Ulimit options (default [])
 ```
+
+## Description
 
 Builds Docker images from a Dockerfile and a "context". A build's context is
 the files located in the specified `PATH` or `URL`. The build process can refer
@@ -286,7 +287,7 @@ $ docker build - < context.tar.gz
 This will build an image for a compressed context read from `STDIN`.  Supported
 formats are: bzip2, gzip and xz.
 
-### Usage of .dockerignore
+### Use a .dockerignore file
 
 ```bash
 $ docker build .
@@ -316,7 +317,7 @@ directory from the context. Its effect can be seen in the changed size of the
 uploaded context. The builder reference contains detailed information on
 [creating a .dockerignore file](../builder.md#dockerignore-file)
 
-### Tag image (-t)
+### Tag an image (-t)
 
 ```bash
 $ docker build -t vieux/apache:2.0 .
@@ -335,7 +336,7 @@ For example, to tag an image both as `whenry/fedora-jboss:latest` and
 ```bash
 $ docker build -t whenry/fedora-jboss:latest -t whenry/fedora-jboss:v2.1 .
 ```
-### Specify Dockerfile (-f)
+### Specify a Dockerfile (-f)
 
 ```bash
 $ docker build -f Dockerfile.debug .
@@ -374,7 +375,7 @@ the command line.
 > repeatable builds on remote Docker hosts. This is also the reason why
 > `ADD ../file` will not work.
 
-### Optional parent cgroup (--cgroup-parent)
+### Use a custom parent cgroup (--cgroup-parent)
 
 When `docker build` is run with the `--cgroup-parent` option the containers
 used in the build will be run with the [corresponding `docker run`

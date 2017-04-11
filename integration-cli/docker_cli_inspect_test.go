@@ -417,3 +417,50 @@ func (s *DockerSuite) TestInspectAmpersand(c *check.C) {
 	out, _ = dockerCmd(c, "inspect", name)
 	c.Assert(out, checker.Contains, `soanni&rtr`)
 }
+
+func (s *DockerSuite) TestInspectPlugin(c *check.C) {
+	testRequires(c, DaemonIsLinux, IsAmd64, Network)
+	_, _, err := dockerCmdWithError("plugin", "install", "--grant-all-permissions", pNameWithTag)
+	c.Assert(err, checker.IsNil)
+
+	out, _, err := dockerCmdWithError("inspect", "--type", "plugin", "--format", "{{.Name}}", pNameWithTag)
+	c.Assert(err, checker.IsNil)
+	c.Assert(strings.TrimSpace(out), checker.Equals, pNameWithTag)
+
+	out, _, err = dockerCmdWithError("inspect", "--format", "{{.Name}}", pNameWithTag)
+	c.Assert(err, checker.IsNil)
+	c.Assert(strings.TrimSpace(out), checker.Equals, pNameWithTag)
+
+	// Even without tag the inspect still work
+	out, _, err = dockerCmdWithError("inspect", "--type", "plugin", "--format", "{{.Name}}", pNameWithTag)
+	c.Assert(err, checker.IsNil)
+	c.Assert(strings.TrimSpace(out), checker.Equals, pNameWithTag)
+
+	out, _, err = dockerCmdWithError("inspect", "--format", "{{.Name}}", pNameWithTag)
+	c.Assert(err, checker.IsNil)
+	c.Assert(strings.TrimSpace(out), checker.Equals, pNameWithTag)
+
+	_, _, err = dockerCmdWithError("plugin", "disable", pNameWithTag)
+	c.Assert(err, checker.IsNil)
+
+	out, _, err = dockerCmdWithError("plugin", "remove", pNameWithTag)
+	c.Assert(err, checker.IsNil)
+	c.Assert(out, checker.Contains, pNameWithTag)
+}
+
+// Test case for 29185
+func (s *DockerSuite) TestInspectUnknownObject(c *check.C) {
+	// This test should work on both Windows and Linux
+	out, _, err := dockerCmdWithError("inspect", "foobar")
+	c.Assert(err, checker.NotNil)
+	c.Assert(out, checker.Contains, "Error: No such object: foobar")
+	c.Assert(err.Error(), checker.Contains, "Error: No such object: foobar")
+}
+
+func (s *DockerSuite) TestInpectInvalidReference(c *check.C) {
+	// This test should work on both Windows and Linux
+	out, _, err := dockerCmdWithError("inspect", "FooBar")
+	c.Assert(err, checker.NotNil)
+	c.Assert(out, checker.Contains, "Error: No such object: FooBar")
+	c.Assert(err.Error(), checker.Contains, "Error: No such object: FooBar")
+}

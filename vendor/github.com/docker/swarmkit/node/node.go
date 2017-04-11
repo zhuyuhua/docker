@@ -14,6 +14,7 @@ import (
 
 	"github.com/Sirupsen/logrus"
 	"github.com/boltdb/bolt"
+	"github.com/docker/docker/pkg/plugingetter"
 	"github.com/docker/swarmkit/agent"
 	"github.com/docker/swarmkit/agent/exec"
 	"github.com/docker/swarmkit/api"
@@ -22,6 +23,7 @@ import (
 	"github.com/docker/swarmkit/log"
 	"github.com/docker/swarmkit/manager"
 	"github.com/docker/swarmkit/manager/encryption"
+	"github.com/docker/swarmkit/manager/state/raft"
 	"github.com/docker/swarmkit/remotes"
 	"github.com/docker/swarmkit/xnet"
 	"github.com/pkg/errors"
@@ -94,6 +96,9 @@ type Config struct {
 	// UnlockKey is the key to unlock a node - used for decrypting at rest.  This
 	// only applies to nodes that have already joined a cluster.
 	UnlockKey []byte
+
+	// PluginGetter provides access to docker's plugin inventory.
+	PluginGetter plugingetter.PluginGetter
 }
 
 // Node implements the primary node functionality for a member of a swarm
@@ -329,6 +334,14 @@ func (n *Node) Stop(ctx context.Context) error {
 	default:
 		return errNodeNotStarted
 	}
+	// ask agent to clean up assignments
+	n.Lock()
+	if n.agent != nil {
+		if err := n.agent.Leave(ctx); err != nil {
+			log.G(ctx).WithError(err).Error("agent failed to clean up assignments")
+		}
+	}
+	n.Unlock()
 
 	n.stopOnce.Do(func() {
 		close(n.stopped)
@@ -672,6 +685,7 @@ func (n *Node) runManager(ctx context.Context, securityConfig *ca.SecurityConfig
 			ElectionTick:     n.config.ElectionTick,
 			AutoLockManagers: n.config.AutoLockManagers,
 			UnlockKey:        n.unlockKey,
+			PluginGetter:     n.config.PluginGetter,
 		})
 		if err != nil {
 			return err
@@ -718,7 +732,7 @@ func (n *Node) runManager(ctx context.Context, securityConfig *ca.SecurityConfig
 		case <-done:
 			// Fail out if m.Run() returns error, otherwise wait for
 			// role change.
-			if runErr != nil {
+			if runErr != nil && runErr != raft.ErrMemberRemoved {
 				err = runErr
 			} else {
 				err = <-roleChanged

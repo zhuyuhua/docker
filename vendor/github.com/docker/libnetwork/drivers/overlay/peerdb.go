@@ -6,7 +6,7 @@ import (
 	"sync"
 	"syscall"
 
-	log "github.com/Sirupsen/logrus"
+	"github.com/Sirupsen/logrus"
 )
 
 const ovPeerTable = "overlay_peer_table"
@@ -80,25 +80,29 @@ func (d *driver) peerDbWalk(f func(string, *peerKey, *peerEntry) bool) error {
 func (d *driver) peerDbNetworkWalk(nid string, f func(*peerKey, *peerEntry) bool) error {
 	d.peerDb.Lock()
 	pMap, ok := d.peerDb.mp[nid]
+	d.peerDb.Unlock()
+
 	if !ok {
-		d.peerDb.Unlock()
 		return nil
 	}
-	d.peerDb.Unlock()
+
+	mp := map[string]peerEntry{}
 
 	pMap.Lock()
 	for pKeyStr, pEntry := range pMap.mp {
+		mp[pKeyStr] = pEntry
+	}
+	pMap.Unlock()
+
+	for pKeyStr, pEntry := range mp {
 		var pKey peerKey
 		if _, err := fmt.Sscan(pKeyStr, &pKey); err != nil {
-			log.Warnf("Peer key scan on network %s failed: %v", nid, err)
+			logrus.Warnf("Peer key scan on network %s failed: %v", nid, err)
 		}
-
 		if f(&pKey, &pEntry) {
-			pMap.Unlock()
 			return nil
 		}
 	}
-	pMap.Unlock()
 
 	return nil
 }
@@ -277,7 +281,7 @@ func (d *driver) peerAdd(nid, eid string, peerIP net.IP, peerIPMask net.IPMask,
 
 	s := n.getSubnetforIP(IP)
 	if s == nil {
-		return fmt.Errorf("couldn't find the subnet %q in network %q\n", IP.String(), n.id)
+		return fmt.Errorf("couldn't find the subnet %q in network %q", IP.String(), n.id)
 	}
 
 	if err := n.obtainVxlanID(s); err != nil {
@@ -289,7 +293,7 @@ func (d *driver) peerAdd(nid, eid string, peerIP net.IP, peerIPMask net.IPMask,
 	}
 
 	if err := d.checkEncryption(nid, vtep, n.vxlanID(s), false, true); err != nil {
-		log.Warn(err)
+		logrus.Warn(err)
 	}
 
 	// Add neighbor entry for the peer IP
@@ -349,7 +353,7 @@ func (d *driver) peerDelete(nid, eid string, peerIP net.IP, peerIPMask net.IPMas
 	}
 
 	if err := d.checkEncryption(nid, vtep, 0, false, false); err != nil {
-		log.Warn(err)
+		logrus.Warn(err)
 	}
 
 	return nil
@@ -359,6 +363,15 @@ func (d *driver) pushLocalDb() {
 	d.peerDbWalk(func(nid string, pKey *peerKey, pEntry *peerEntry) bool {
 		if pEntry.isLocal {
 			d.pushLocalEndpointEvent("join", nid, pEntry.eid)
+		}
+		return false
+	})
+}
+
+func (d *driver) peerDBUpdateSelf() {
+	d.peerDbWalk(func(nid string, pkey *peerKey, pEntry *peerEntry) bool {
+		if pEntry.isLocal {
+			pEntry.vtep = net.ParseIP(d.advertiseAddress)
 		}
 		return false
 	})

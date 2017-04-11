@@ -117,6 +117,9 @@ run: build ## run the docker daemon in a container
 shell: build ## start a shell inside the build env
 	$(DOCKER_RUN_DOCKER) bash
 
+yaml-docs-gen: build ## generate documentation YAML files consumed by docs repo
+	$(DOCKER_RUN_DOCKER) sh -c 'hack/make.sh yaml-docs-generator && ( root=$$(pwd); cd bundles/latest/yaml-docs-generator; mkdir docs; ./yaml-docs-generator --root $${root} --target $$(pwd)/docs )'
+
 test: build ## run the unit, integration and docker-py tests
 	$(DOCKER_RUN_DOCKER) hack/make.sh dynbinary cross test-unit test-integration-cli test-docker-py
 
@@ -144,4 +147,4 @@ swagger-gen:
 		-w /go/src/github.com/docker/docker \
 		--entrypoint hack/generate-swagger-api.sh \
 		-e GOPATH=/go \
-		quay.io/goswagger/swagger
+		quay.io/goswagger/swagger:0.7.4

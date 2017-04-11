@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Sirupsen/logrus"
+	"github.com/docker/docker/pkg/plugingetter"
 	"github.com/docker/go-events"
 	"github.com/docker/swarmkit/api"
 	"github.com/docker/swarmkit/ca"
@@ -99,6 +100,9 @@ type Config struct {
 	// bootstrapping a cluster for the first time (it's a cluster-wide setting),
 	// and also when loading up any raft data on disk (as a KEK for the raft DEK).
 	UnlockKey []byte
+
+	// PluginGetter provides access to docker's plugin inventory.
+	PluginGetter plugingetter.PluginGetter
 }
 
 // Manager is the cluster manager for Swarm.
@@ -256,7 +260,7 @@ func New(config *Config) (*Manager, error) {
 		listeners:   listeners,
 		caserver:    ca.NewServer(raftNode.MemoryStore(), config.SecurityConfig),
 		dispatcher:  dispatcher.New(raftNode, dispatcherConfig),
-		logbroker:   logbroker.New(),
+		logbroker:   logbroker.New(raftNode.MemoryStore()),
 		server:      grpc.NewServer(opts...),
 		localserver: grpc.NewServer(opts...),
 		raftNode:    raftNode,
@@ -309,7 +313,7 @@ func (m *Manager) Run(parent context.Context) error {
 		return err
 	}
 
-	baseControlAPI := controlapi.NewServer(m.raftNode.MemoryStore(), m.raftNode, m.config.SecurityConfig.RootCA())
+	baseControlAPI := controlapi.NewServer(m.raftNode.MemoryStore(), m.raftNode, m.config.SecurityConfig.RootCA(), m.config.PluginGetter)
 	baseResourceAPI := resourceapi.New(m.raftNode.MemoryStore())
 	healthServer := health.NewHealthServer()
 	localHealthServer := health.NewHealthServer()
@@ -385,30 +389,39 @@ func (m *Manager) Run(parent context.Context) error {
 
 	close(m.started)
 
-	watchDone := make(chan struct{})
-	watchCtx, watchCtxCancel := context.WithCancel(parent)
+	errCh := make(chan error, 1)
 	go func() {
 		err := m.raftNode.Run(ctx)
-		watchCtxCancel()
-		<-watchDone
 		if err != nil {
-			log.G(ctx).Error(err)
+			errCh <- err
+			log.G(ctx).WithError(err).Error("raft node stopped")
 			m.Stop(ctx)
 		}
 	}()
 
-	if err := raft.WaitForLeader(ctx, m.raftNode); err != nil {
+	returnErr := func(err error) error {
+		select {
+		case runErr := <-errCh:
+			if runErr == raft.ErrMemberRemoved {
+				return runErr
+			}
+		default:
+		}
 		return err
+	}
+
+	if err := raft.WaitForLeader(ctx, m.raftNode); err != nil {
+		return returnErr(err)
 	}
 
 	c, err := raft.WaitForCluster(ctx, m.raftNode)
 	if err != nil {
-		return err
+		return returnErr(err)
 	}
 	raftConfig := c.Spec.Raft
 
-	if err := m.watchForKEKChanges(watchCtx, watchDone); err != nil {
-		return err
+	if err := m.watchForKEKChanges(ctx); err != nil {
+		return returnErr(err)
 	}
 
 	if int(raftConfig.ElectionTick) != m.raftNode.Config.ElectionTick {
@@ -427,7 +440,8 @@ func (m *Manager) Run(parent context.Context) error {
 	}
 	m.mu.Unlock()
 	m.Stop(ctx)
-	return err
+
+	return returnErr(err)
 }
 
 const stopTimeout = 8 * time.Second
@@ -544,8 +558,7 @@ func (m *Manager) updateKEK(ctx context.Context, cluster *api.Cluster) error {
 	return nil
 }
 
-func (m *Manager) watchForKEKChanges(ctx context.Context, watchDone chan struct{}) error {
-	defer close(watchDone)
+func (m *Manager) watchForKEKChanges(ctx context.Context) error {
 	clusterID := m.config.SecurityConfig.ClientTLSCreds.Organization()
 	clusterWatch, clusterWatchCancel, err := store.ViewAndWatch(m.raftNode.MemoryStore(),
 		func(tx store.ReadTx) error {
@@ -771,7 +784,7 @@ func (m *Manager) becomeLeader(ctx context.Context) {
 	// shutdown underlying manager processes when leadership is
 	// lost.
 
-	m.allocator, err = allocator.New(s)
+	m.allocator, err = allocator.New(s, m.config.PluginGetter)
 	if err != nil {
 		log.G(ctx).WithError(err).Error("failed to create allocator")
 		// TODO(stevvooe): It doesn't seem correct here to fail

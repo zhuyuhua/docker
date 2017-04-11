@@ -2,7 +2,7 @@
 % Docker Community
 % JUNE 2014
 # NAME
-docker-build - Build a new image from the source code at PATH
+docker-build - Build an image from a Dockerfile
 
 # SYNOPSIS
 **docker build**
@@ -83,7 +83,7 @@ set as the **URL**, the repository is cloned locally and then sent as the contex
    Users pass these values at build-time. Docker uses the `buildargs` as the
    environment context for command(s) run via the Dockerfile's `RUN` instruction
    or for variable expansion in other Dockerfile instructions. This is not meant
-   for passing secret values. [Read more about the buildargs instruction](/reference/builder/#arg)
+   for passing secret values. [Read more about the buildargs instruction](https://docs.docker.com/engine/reference/builder/#arg)
 
 **--force-rm**=*true*|*false*
    Always remove intermediate containers, even after unsuccessful builds. The default is *false*.
@@ -129,8 +129,10 @@ set as the **URL**, the repository is cloned locally and then sent as the contex
 `k` (kilobytes), `m` (megabytes), or `g` (gigabytes). If you don't specify a
 unit, `b` is used. Set LIMIT to `-1` to enable unlimited swap.
 
-**--network**=*NETWORK*
-  
+**--network**=*bridge*
+  Set the networking mode for the RUN instructions during build. Supported standard
+  values are: `bridge`, `host`, `none` and `container:<name|id>`. Any other value
+  is taken as a custom network's name or ID which this container should connect to.
 
 **--shm-size**=*SHM-SIZE*
   Size of `/dev/shm`. The format is `<number><unit>`. `number` must be greater than `0`.

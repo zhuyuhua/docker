@@ -220,48 +220,24 @@ func TestUpdatePorts(t *testing.T) {
 	assert.Equal(t, targetPorts[1], 1000)
 }
 
-func TestUpdatePortsDuplicateEntries(t *testing.T) {
+func TestUpdatePortsDuplicate(t *testing.T) {
 	// Test case for #25375
 	flags := newUpdateCommand(nil).Flags()
 	flags.Set("publish-add", "80:80")
 
 	portConfigs := []swarm.PortConfig{
-		{TargetPort: 80, PublishedPort: 80},
+		{
+			TargetPort:    80,
+			PublishedPort: 80,
+			Protocol:      swarm.PortConfigProtocolTCP,
+			PublishMode:   swarm.PortConfigPublishModeIngress,
+		},
 	}
 
 	err := updatePorts(flags, &portConfigs)
 	assert.Equal(t, err, nil)
 	assert.Equal(t, len(portConfigs), 1)
 	assert.Equal(t, portConfigs[0].TargetPort, uint32(80))
-}
-
-func TestUpdatePortsDuplicateKeys(t *testing.T) {
-	// Test case for #25375
-	flags := newUpdateCommand(nil).Flags()
-	flags.Set("publish-add", "80:20")
-
-	portConfigs := []swarm.PortConfig{
-		{TargetPort: 80, PublishedPort: 80},
-	}
-
-	err := updatePorts(flags, &portConfigs)
-	assert.Equal(t, err, nil)
-	assert.Equal(t, len(portConfigs), 1)
-	assert.Equal(t, portConfigs[0].TargetPort, uint32(20))
-}
-
-func TestUpdatePortsConflictingFlags(t *testing.T) {
-	// Test case for #25375
-	flags := newUpdateCommand(nil).Flags()
-	flags.Set("publish-add", "80:80")
-	flags.Set("publish-add", "80:20")
-
-	portConfigs := []swarm.PortConfig{
-		{TargetPort: 80, PublishedPort: 80},
-	}
-
-	err := updatePorts(flags, &portConfigs)
-	assert.Error(t, err, "conflicting port mapping")
 }
 
 func TestUpdateHealthcheckTable(t *testing.T) {
@@ -337,5 +313,72 @@ func TestUpdateHealthcheckTable(t *testing.T) {
 				t.Errorf("incorrect result for test %d, expected health config:\n\t%#v\ngot:\n\t%#v", i, c.expected, cspec.Healthcheck)
 			}
 		}
+	}
+}
+
+func TestUpdateHosts(t *testing.T) {
+	flags := newUpdateCommand(nil).Flags()
+	flags.Set("host-add", "example.net:2.2.2.2")
+	flags.Set("host-add", "ipv6.net:2001:db8:abc8::1")
+	// remove with ipv6 should work
+	flags.Set("host-rm", "example.net:2001:db8:abc8::1")
+	// just hostname should work as well
+	flags.Set("host-rm", "example.net")
+	// bad format error
+	assert.Error(t, flags.Set("host-add", "$example.com$"), "bad format for add-host:")
+
+	hosts := []string{"1.2.3.4 example.com", "4.3.2.1 example.org", "2001:db8:abc8::1 example.net"}
+
+	updateHosts(flags, &hosts)
+	assert.Equal(t, len(hosts), 3)
+	assert.Equal(t, hosts[0], "1.2.3.4 example.com")
+	assert.Equal(t, hosts[1], "2001:db8:abc8::1 ipv6.net")
+	assert.Equal(t, hosts[2], "4.3.2.1 example.org")
+}
+
+func TestUpdatePortsRmWithProtocol(t *testing.T) {
+	flags := newUpdateCommand(nil).Flags()
+	flags.Set("publish-add", "8081:81")
+	flags.Set("publish-add", "8082:82")
+	flags.Set("publish-rm", "80")
+	flags.Set("publish-rm", "81/tcp")
+	flags.Set("publish-rm", "82/udp")
+
+	portConfigs := []swarm.PortConfig{
+		{
+			TargetPort:    80,
+			PublishedPort: 8080,
+			Protocol:      swarm.PortConfigProtocolTCP,
+			PublishMode:   swarm.PortConfigPublishModeIngress,
+		},
+	}
+
+	err := updatePorts(flags, &portConfigs)
+	assert.Equal(t, err, nil)
+	assert.Equal(t, len(portConfigs), 2)
+	assert.Equal(t, portConfigs[0].TargetPort, uint32(81))
+	assert.Equal(t, portConfigs[1].TargetPort, uint32(82))
+}
+
+// FIXME(vdemeester) port to opts.PortOpt
+func TestValidatePort(t *testing.T) {
+	validPorts := []string{"80/tcp", "80", "80/udp"}
+	invalidPorts := map[string]string{
+		"9999999":   "out of range",
+		"80:80/tcp": "invalid port format",
+		"53:53/udp": "invalid port format",
+		"80:80":     "invalid port format",
+		"80/xyz":    "invalid protocol",
+		"tcp":       "invalid syntax",
+		"udp":       "invalid syntax",
+		"":          "invalid protocol",
+	}
+	for _, port := range validPorts {
+		_, err := validatePublishRemove(port)
+		assert.Equal(t, err, nil)
+	}
+	for port, e := range invalidPorts {
+		_, err := validatePublishRemove(port)
+		assert.Error(t, err, e)
 	}
 }

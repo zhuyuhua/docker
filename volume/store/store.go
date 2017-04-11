@@ -1,8 +1,6 @@
 package store
 
 import (
-	"bytes"
-	"encoding/json"
 	"net"
 	"os"
 	"path/filepath"
@@ -19,15 +17,8 @@ import (
 )
 
 const (
-	volumeDataDir    = "volumes"
-	volumeBucketName = "volumes"
+	volumeDataDir = "volumes"
 )
-
-type volumeMetadata struct {
-	Name    string
-	Labels  map[string]string
-	Options map[string]string
-}
 
 type volumeWrapper struct {
 	volume.Volume
@@ -89,23 +80,24 @@ func New(rootPath string) (*VolumeStore, error) {
 
 		// initialize volumes bucket
 		if err := vs.db.Update(func(tx *bolt.Tx) error {
-			if _, err := tx.CreateBucketIfNotExists([]byte(volumeBucketName)); err != nil {
+			if _, err := tx.CreateBucketIfNotExists(volumeBucketName); err != nil {
 				return errors.Wrap(err, "error while setting up volume store metadata database")
 			}
-
 			return nil
 		}); err != nil {
 			return nil, err
 		}
 	}
 
+	vs.restore()
+
 	return vs, nil
 }
 
 func (s *VolumeStore) getNamed(name string) (volume.Volume, bool) {
-	s.globalLock.Lock()
+	s.globalLock.RLock()
 	v, exists := s.names[name]
-	s.globalLock.Unlock()
+	s.globalLock.RUnlock()
 	return v, exists
 }
 
@@ -121,9 +113,9 @@ func (s *VolumeStore) setNamed(v volume.Volume, ref string) {
 // getRefs gets the list of refs for a given name
 // Callers of this function are expected to hold the name lock.
 func (s *VolumeStore) getRefs(name string) []string {
-	s.globalLock.Lock()
+	s.globalLock.RLock()
 	refs := s.refs[name]
-	s.globalLock.Unlock()
+	s.globalLock.RUnlock()
 	return refs
 }
 
@@ -131,6 +123,15 @@ func (s *VolumeStore) getRefs(name string) []string {
 // the internal data is out of sync with volumes driver plugins.
 func (s *VolumeStore) Purge(name string) {
 	s.globalLock.Lock()
+	v, exists := s.names[name]
+	if exists {
+		if _, err := volumedrivers.RemoveDriver(v.DriverName()); err != nil {
+			logrus.Error("Error dereferencing volume driver: %v", err)
+		}
+	}
+	if err := s.removeMeta(name); err != nil {
+		logrus.Errorf("Error removing volume metadata for volume %q: %v", name, err)
+	}
 	delete(s.names, name)
 	delete(s.refs, name)
 	delete(s.labels, name)
@@ -140,9 +141,12 @@ func (s *VolumeStore) Purge(name string) {
 
 // VolumeStore is a struct that stores the list of volumes available and keeps track of their usage counts
 type VolumeStore struct {
-	locks      *locker.Locker
-	globalLock sync.Mutex
-	// names stores the volume name -> driver name relationship.
+	// locks ensures that only one action is being performed on a particular volume at a time without locking the entire store
+	// since actions on volumes can be quite slow, this ensures the store is free to handle requests for other volumes.
+	locks *locker.Locker
+	// globalLock is used to protect access to mutable structures used by the store object
+	globalLock sync.RWMutex
+	// names stores the volume name -> volume relationship.
 	// This is used for making lookups faster so we don't have to probe all drivers
 	names map[string]volume.Volume
 	// refs stores the volume name and the list of things referencing it
@@ -210,7 +214,9 @@ func (s *VolumeStore) list() ([]volume.Volume, []string, error) {
 				return
 			}
 			for i, v := range vs {
+				s.globalLock.RLock()
 				vs[i] = volumeWrapper{v, s.labels[v.Name()], d.Scope(), s.options[v.Name()]}
+				s.globalLock.RUnlock()
 			}
 
 			chVols <- vols{vols: vs}
@@ -230,11 +236,13 @@ func (s *VolumeStore) list() ([]volume.Volume, []string, error) {
 	}
 
 	if len(badDrivers) > 0 {
+		s.globalLock.RLock()
 		for _, v := range s.names {
 			if _, exists := badDrivers[v.DriverName()]; exists {
 				ls = append(ls, v)
 			}
 		}
+		s.globalLock.RUnlock()
 	}
 	return ls, warnings, nil
 }
@@ -277,54 +285,58 @@ func (s *VolumeStore) Create(name, driverName string, opts, labels map[string]st
 func (s *VolumeStore) checkConflict(name, driverName string) (volume.Volume, error) {
 	// check the local cache
 	v, _ := s.getNamed(name)
-	if v != nil {
-		vDriverName := v.DriverName()
-		if driverName != "" && vDriverName != driverName {
-			// we have what looks like a conflict
-			// let's see if there are existing refs to this volume, if so we don't need
-			// to go any further since we can assume the volume is legit.
-			if len(s.getRefs(name)) > 0 {
-				return nil, errors.Wrapf(errNameConflict, "driver '%s' already has volume '%s'", vDriverName, name)
-			}
+	if v == nil {
+		return nil, nil
+	}
 
-			// looks like there is a conflict, but nothing is referencing it...
-			// let's check if the found volume ref
-			// is stale by checking with the driver if it still exists
-			vd, err := volumedrivers.GetDriver(vDriverName)
-			if err != nil {
-				// play it safe and return the error
-				// TODO(cpuguy83): maybe when when v2 plugins are ubiquitous, we should
-				// just purge this from the cache
-				return nil, errors.Wrapf(errNameConflict, "found reference to volume '%s' in driver '%s', but got an error while checking the driver: %v", name, vDriverName, err)
-			}
+	vDriverName := v.DriverName()
+	var conflict bool
+	if driverName != "" {
+		// Retrieve canonical driver name to avoid inconsistencies (for example
+		// "plugin" vs. "plugin:latest")
+		vd, err := volumedrivers.GetDriver(driverName)
+		if err != nil {
+			return nil, err
+		}
 
-			// now check if it still exists in the driver
-			v2, err := vd.Get(name)
-			err = errors.Cause(err)
-			if err != nil {
-				if _, ok := err.(net.Error); ok {
-					// got some error related to the driver connectivity
-					// play it safe and return the error
-					// TODO(cpuguy83): When when v2 plugins are ubiquitous, maybe we should
-					// just purge this from the cache
-					return nil, errors.Wrapf(errNameConflict, "found reference to volume '%s' in driver '%s', but got an error while checking the driver: %v", name, vDriverName, err)
-				}
+		if vDriverName != vd.Name() {
+			conflict = true
+		}
+	}
 
-				// a driver can return whatever it wants, so let's make sure this is nil
-				if v2 == nil {
-					// purge this reference from the cache
-					s.Purge(name)
-					return nil, nil
-				}
-			}
-			if v2 != nil {
-				return nil, errors.Wrapf(errNameConflict, "driver '%s' already has volume '%s'", vDriverName, name)
-			}
+	// let's check if the found volume ref
+	// is stale by checking with the driver if it still exists
+	exists, err := volumeExists(v)
+	if err != nil {
+		return nil, errors.Wrapf(errNameConflict, "found reference to volume '%s' in driver '%s', but got an error while checking the driver: %v", name, vDriverName, err)
+	}
+
+	if exists {
+		if conflict {
+			return nil, errors.Wrapf(errNameConflict, "driver '%s' already has volume '%s'", vDriverName, name)
 		}
 		return v, nil
 	}
 
+	if len(s.getRefs(v.Name())) > 0 {
+		// Containers are referencing this volume but it doesn't seem to exist anywhere.
+		// Return a conflict error here, the user can fix this with `docker volume rm -f`
+		return nil, errors.Wrapf(errNameConflict, "found references to volume '%s' in driver '%s' but the volume was not found in the driver -- you may need to remove containers referencing this volume or force remove the volume to re-create it", name, vDriverName)
+	}
+
+	// doesn't exist, so purge it from the cache
+	s.Purge(name)
 	return nil, nil
+}
+
+// volumeExists returns if the volume is still present in the driver.
+// An error is returned if there was an issue communicating with the driver.
+func volumeExists(v volume.Volume) (bool, error) {
+	exists, err := lookupVolume(v.DriverName(), v.Name())
+	if err != nil {
+		return false, err
+	}
+	return exists != nil, nil
 }
 
 // create asks the given driver to create a volume with the name/opts.
@@ -347,6 +359,7 @@ func (s *VolumeStore) create(name, driverName string, opts, labels map[string]st
 	if err != nil {
 		return nil, err
 	}
+
 	if v != nil {
 		return v, nil
 	}
@@ -379,27 +392,16 @@ func (s *VolumeStore) create(name, driverName string, opts, labels map[string]st
 	s.options[name] = opts
 	s.globalLock.Unlock()
 
-	if s.db != nil {
-		metadata := &volumeMetadata{
-			Name:    name,
-			Labels:  labels,
-			Options: opts,
-		}
-
-		volData, err := json.Marshal(metadata)
-		if err != nil {
-			return nil, err
-		}
-
-		if err := s.db.Update(func(tx *bolt.Tx) error {
-			b := tx.Bucket([]byte(volumeBucketName))
-			err := b.Put([]byte(name), volData)
-			return err
-		}); err != nil {
-			return nil, errors.Wrap(err, "error while persisting volume metadata")
-		}
+	metadata := volumeMetadata{
+		Name:    name,
+		Driver:  vd.Name(),
+		Labels:  labels,
+		Options: opts,
 	}
 
+	if err := s.setMeta(name, metadata); err != nil {
+		return nil, err
+	}
 	return volumeWrapper{v, labels, vd.Scope(), opts}, nil
 }
 
@@ -423,6 +425,8 @@ func (s *VolumeStore) GetWithRef(name, driverName, ref string) (volume.Volume, e
 
 	s.setNamed(v, ref)
 
+	s.globalLock.RLock()
+	defer s.globalLock.RUnlock()
 	return volumeWrapper{v, s.labels[name], vd.Scope(), s.options[name]}, nil
 }
 
@@ -444,48 +448,41 @@ func (s *VolumeStore) Get(name string) (volume.Volume, error) {
 // if the driver is unknown it probes all drivers until it finds the first volume with that name.
 // it is expected that callers of this function hold any necessary locks
 func (s *VolumeStore) getVolume(name string) (volume.Volume, error) {
-	labels := map[string]string{}
-	options := map[string]string{}
+	var meta volumeMetadata
+	meta, err := s.getMeta(name)
+	if err != nil {
+		return nil, err
+	}
 
-	if s.db != nil {
-		// get meta
-		if err := s.db.Update(func(tx *bolt.Tx) error {
-			b := tx.Bucket([]byte(volumeBucketName))
-			data := b.Get([]byte(name))
-
-			if string(data) == "" {
-				return nil
+	driverName := meta.Driver
+	if driverName == "" {
+		s.globalLock.RLock()
+		v, exists := s.names[name]
+		s.globalLock.RUnlock()
+		if exists {
+			meta.Driver = v.DriverName()
+			if err := s.setMeta(name, meta); err != nil {
+				return nil, err
 			}
-
-			var meta volumeMetadata
-			buf := bytes.NewBuffer(data)
-
-			if err := json.NewDecoder(buf).Decode(&meta); err != nil {
-				return err
-			}
-			labels = meta.Labels
-			options = meta.Options
-
-			return nil
-		}); err != nil {
-			return nil, err
 		}
 	}
 
-	logrus.Debugf("Getting volume reference for name: %s", name)
-	s.globalLock.Lock()
-	v, exists := s.names[name]
-	s.globalLock.Unlock()
-	if exists {
-		vd, err := volumedrivers.GetDriver(v.DriverName())
+	if meta.Driver != "" {
+		vol, err := lookupVolume(meta.Driver, name)
 		if err != nil {
 			return nil, err
 		}
-		vol, err := vd.Get(name)
-		if err != nil {
-			return nil, err
+		if vol == nil {
+			s.Purge(name)
+			return nil, errNoSuchVolume
 		}
-		return volumeWrapper{vol, labels, vd.Scope(), options}, nil
+
+		var scope string
+		vd, err := volumedrivers.GetDriver(meta.Driver)
+		if err == nil {
+			scope = vd.Scope()
+		}
+		return volumeWrapper{vol, meta.Labels, scope, meta.Options}, nil
 	}
 
 	logrus.Debugf("Probing all drivers for volume with name: %s", name)
@@ -496,13 +493,40 @@ func (s *VolumeStore) getVolume(name string) (volume.Volume, error) {
 
 	for _, d := range drivers {
 		v, err := d.Get(name)
-		if err != nil {
+		if err != nil || v == nil {
 			continue
 		}
-
-		return volumeWrapper{v, labels, d.Scope(), options}, nil
+		meta.Driver = v.DriverName()
+		if err := s.setMeta(name, meta); err != nil {
+			return nil, err
+		}
+		return volumeWrapper{v, meta.Labels, d.Scope(), meta.Options}, nil
 	}
 	return nil, errNoSuchVolume
+}
+
+// lookupVolume gets the specified volume from the specified driver.
+// This will only return errors related to communications with the driver.
+// If the driver returns an error that is not communication related the
+//   error is logged but not returned.
+// If the volume is not found it will return `nil, nil``
+func lookupVolume(driverName, volumeName string) (volume.Volume, error) {
+	vd, err := volumedrivers.GetDriver(driverName)
+	if err != nil {
+		return nil, errors.Wrapf(err, "error while checking if volume %q exists in driver %q", volumeName, driverName)
+	}
+	v, err := vd.Get(volumeName)
+	if err != nil {
+		err = errors.Cause(err)
+		if _, ok := err.(net.Error); ok {
+			return nil, errors.Wrapf(err, "error while checking if volume %q exists in driver %q", v.Name(), v.DriverName())
+		}
+
+		// At this point, the error could be anything from the driver, such as "no such volume"
+		// Let's not check an error here, and instead check if the driver returned a volume
+		logrus.WithError(err).WithField("driver", driverName).WithField("volume", volumeName).Warnf("Error while looking up volume")
+	}
+	return v, nil
 }
 
 // Remove removes the requested volume. A volume is not removed if it has any refs
@@ -516,7 +540,7 @@ func (s *VolumeStore) Remove(v volume.Volume) error {
 		return &OpErr{Err: errVolumeInUse, Name: v.Name(), Op: "remove", Refs: refs}
 	}
 
-	vd, err := volumedrivers.RemoveDriver(v.DriverName())
+	vd, err := volumedrivers.GetDriver(v.DriverName())
 	if err != nil {
 		return &OpErr{Err: err, Name: vd.Name(), Op: "remove"}
 	}
@@ -571,10 +595,12 @@ func (s *VolumeStore) FilterByDriver(name string) ([]volume.Volume, error) {
 	}
 	for i, v := range ls {
 		options := map[string]string{}
+		s.globalLock.RLock()
 		for key, value := range s.options[v.Name()] {
 			options[key] = value
 		}
 		ls[i] = volumeWrapper{v, s.labels[v.Name()], vd.Scope(), options}
+		s.globalLock.RUnlock()
 	}
 	return ls, nil
 }
@@ -614,4 +640,10 @@ func unwrapVolume(v volume.Volume) volume.Volume {
 	}
 
 	return v
+}
+
+// Shutdown releases all resources used by the volume store
+// It does not make any changes to volumes, drivers, etc.
+func (s *VolumeStore) Shutdown() error {
+	return s.db.Close()
 }

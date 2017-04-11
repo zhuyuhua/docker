@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"net"
 
-	log "github.com/Sirupsen/logrus"
+	"github.com/Sirupsen/logrus"
 	"github.com/docker/docker/pkg/plugins"
 	"github.com/docker/libnetwork/datastore"
 	"github.com/docker/libnetwork/discoverapi"
@@ -29,23 +29,30 @@ func newDriver(name string, client *plugins.Client) driverapi.Driver {
 // Init makes sure a remote driver is registered when a network driver
 // plugin is activated.
 func Init(dc driverapi.DriverCallback, config map[string]interface{}) error {
-	// Unit test code is unaware of a true PluginStore. So we fall back to v1 plugins.
-	handleFunc := plugins.Handle
-	if pg := dc.GetPluginGetter(); pg != nil {
-		handleFunc = pg.Handle
-	}
-	handleFunc(driverapi.NetworkPluginEndpointType, func(name string, client *plugins.Client) {
+	newPluginHandler := func(name string, client *plugins.Client) {
 		// negotiate driver capability with client
 		d := newDriver(name, client)
 		c, err := d.(*driver).getCapabilities()
 		if err != nil {
-			log.Errorf("error getting capability for %s due to %v", name, err)
+			logrus.Errorf("error getting capability for %s due to %v", name, err)
 			return
 		}
 		if err = dc.RegisterDriver(name, d, *c); err != nil {
-			log.Errorf("error registering driver for %s due to %v", name, err)
+			logrus.Errorf("error registering driver for %s due to %v", name, err)
 		}
-	})
+	}
+
+	// Unit test code is unaware of a true PluginStore. So we fall back to v1 plugins.
+	handleFunc := plugins.Handle
+	if pg := dc.GetPluginGetter(); pg != nil {
+		handleFunc = pg.Handle
+		activePlugins := pg.GetAllManagedPluginsByCap(driverapi.NetworkPluginEndpointType)
+		for _, ap := range activePlugins {
+			newPluginHandler(ap.Name(), ap.Client())
+		}
+	}
+	handleFunc(driverapi.NetworkPluginEndpointType, newPluginHandler)
+
 	return nil
 }
 
@@ -303,6 +310,10 @@ func (d *driver) RevokeExternalConnectivity(nid, eid string) error {
 
 func (d *driver) Type() string {
 	return d.networkType
+}
+
+func (d *driver) IsBuiltIn() bool {
+	return false
 }
 
 // DiscoverNew is a notification for a new discovery event, such as a new node joining a cluster

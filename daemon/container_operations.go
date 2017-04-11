@@ -851,9 +851,11 @@ func (daemon *Daemon) initializeNetworking(container *container.Container) error
 	}
 
 	if container.HostConfig.NetworkMode.IsHost() {
-		container.Config.Hostname, err = os.Hostname()
-		if err != nil {
-			return err
+		if container.Config.Hostname == "" {
+			container.Config.Hostname, err = os.Hostname()
+			if err != nil {
+				return err
+			}
 		}
 	}
 
@@ -1028,7 +1030,7 @@ func (daemon *Daemon) ActivateContainerServiceBinding(containerName string) erro
 	}
 	sb := daemon.getNetworkSandbox(container)
 	if sb == nil {
-		return fmt.Errorf("network sandbox not exists for container %s", containerName)
+		return fmt.Errorf("network sandbox does not exist for container %s", containerName)
 	}
 	return sb.EnableService()
 }
@@ -1041,7 +1043,7 @@ func (daemon *Daemon) DeactivateContainerServiceBinding(containerName string) er
 	}
 	sb := daemon.getNetworkSandbox(container)
 	if sb == nil {
-		return fmt.Errorf("network sandbox not exists for container %s", containerName)
+		return fmt.Errorf("network sandbox does not exist for container %s", containerName)
 	}
 	return sb.DisableService()
 }

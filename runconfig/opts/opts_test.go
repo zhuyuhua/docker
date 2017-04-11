@@ -3,6 +3,7 @@ package opts
 import (
 	"fmt"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -50,6 +51,10 @@ func TestValidateEnv(t *testing.T) {
 		"  some space before": "  some space before",
 		"some space after  ":  "some space after  ",
 	}
+	// Environment variables are case in-sensitive on Windows
+	if runtime.GOOS == "windows" {
+		valids["PaTh"] = fmt.Sprintf("PaTh=%v", os.Getenv("PATH"))
+	}
 	for value, expected := range valids {
 		actual, err := ValidateEnv(value)
 		if err != nil {
@@ -57,42 +62,6 @@ func TestValidateEnv(t *testing.T) {
 		}
 		if actual != expected {
 			t.Fatalf("Expected [%v], got [%v]", expected, actual)
-		}
-	}
-}
-
-func TestValidateArg(t *testing.T) {
-	valids := map[string]string{
-		"_=a":                "_=a",
-		"var1=value1":        "var1=value1",
-		"_var1=value1":       "_var1=value1",
-		"var2=value2=value3": "var2=value2=value3",
-		"var3=abc!qwe":       "var3=abc!qwe",
-		"var_4=value 4":      "var_4=value 4",
-		"var_5=":             "var_5=",
-	}
-	for value, expected := range valids {
-		actual, err := ValidateArg(value)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if actual != expected {
-			t.Fatalf("Expected [%v], got [%v]", expected, actual)
-		}
-	}
-
-	invalid := map[string]string{
-		"foo":  "bad format",
-		"=foo": "bad format",
-		"cc c": "bad format",
-	}
-	for value, expectedError := range invalid {
-		if _, err := ValidateArg(value); err == nil {
-			t.Fatalf("ValidateArg(`%s`) should have failed validation", value)
-		} else {
-			if !strings.Contains(err.Error(), expectedError) {
-				t.Fatalf("ValidateArg(`%s`) error should contain %q", value, expectedError)
-			}
 		}
 	}
 }

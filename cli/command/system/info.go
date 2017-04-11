@@ -2,6 +2,7 @@ package system
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -131,6 +132,17 @@ func prettyPrintInfo(dockerCli *command.DockerCli, info types.Info) error {
 			}
 		}
 		fmt.Fprintf(dockerCli.Out(), " Node Address: %s\n", info.Swarm.NodeAddr)
+		managers := []string{}
+		for _, entry := range info.Swarm.RemoteManagers {
+			managers = append(managers, entry.Addr)
+		}
+		if len(managers) > 0 {
+			sort.Strings(managers)
+			fmt.Fprintf(dockerCli.Out(), " Manager Addresses:\n")
+			for _, entry := range managers {
+				fmt.Fprintf(dockerCli.Out(), "  %s\n", entry)
+			}
+		}
 	}
 
 	if len(info.Runtimes) > 0 {
@@ -143,17 +155,38 @@ func prettyPrintInfo(dockerCli *command.DockerCli, info types.Info) error {
 	}
 
 	if info.OSType == "linux" {
+		fmt.Fprintf(dockerCli.Out(), "Init Binary: %v\n", info.InitBinary)
+
+		for _, ci := range []struct {
+			Name   string
+			Commit types.Commit
+		}{
+			{"containerd", info.ContainerdCommit},
+			{"runc", info.RuncCommit},
+			{"init", info.InitCommit},
+		} {
+			fmt.Fprintf(dockerCli.Out(), "%s version: %s", ci.Name, ci.Commit.ID)
+			if ci.Commit.ID != ci.Commit.Expected {
+				fmt.Fprintf(dockerCli.Out(), " (expected: %s)", ci.Commit.Expected)
+			}
+			fmt.Fprintf(dockerCli.Out(), "\n")
+		}
 		if len(info.SecurityOptions) != 0 {
+			kvs, err := types.DecodeSecurityOptions(info.SecurityOptions)
+			if err != nil {
+				return err
+			}
 			fmt.Fprintf(dockerCli.Out(), "Security Options:\n")
-			for _, o := range info.SecurityOptions {
-				switch o.Key {
-				case "Name":
-					fmt.Fprintf(dockerCli.Out(), " %s\n", o.Value)
-				case "Profile":
-					if o.Value != "default" {
-						fmt.Fprintf(dockerCli.Err(), "  WARNING: You're not using the default seccomp profile\n")
+			for _, so := range kvs {
+				fmt.Fprintf(dockerCli.Out(), " %s\n", so.Name)
+				for _, o := range so.Options {
+					switch o.Key {
+					case "profile":
+						if o.Value != "default" {
+							fmt.Fprintf(dockerCli.Err(), "  WARNING: You're not using the default seccomp profile\n")
+						}
+						fmt.Fprintf(dockerCli.Out(), "  Profile: %s\n", o.Value)
 					}
-					fmt.Fprintf(dockerCli.Out(), "  %s: %s\n", o.Key, o.Value)
 				}
 			}
 		}

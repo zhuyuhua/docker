@@ -88,6 +88,11 @@ func NewDaemon(c *check.C) *Daemon {
 	}
 }
 
+// RootDir returns the root directory of the daemon.
+func (d *Daemon) RootDir() string {
+	return d.root
+}
+
 func (d *Daemon) getClientConfig() (*clientConfig, error) {
 	var (
 		transport *http.Transport
@@ -495,7 +500,7 @@ func (d *Daemon) SockRequest(method, endpoint string, data interface{}) (int, []
 	return res.StatusCode, b, err
 }
 
-// SockRequestRaw executes a socket request on a daemon and returns a http
+// SockRequestRaw executes a socket request on a daemon and returns an http
 // response and a reader for the output data.
 func (d *Daemon) SockRequestRaw(method, endpoint string, data io.Reader, ct string) (*http.Response, io.ReadCloser, error) {
 	return sockRequestRawToDaemon(method, endpoint, data, ct, d.sock())

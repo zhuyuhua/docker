@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/Microsoft/go-winio"
@@ -30,7 +31,9 @@ import (
 	"github.com/docker/docker/pkg/ioutils"
 	"github.com/docker/docker/pkg/longpath"
 	"github.com/docker/docker/pkg/reexec"
-	"github.com/docker/go-units"
+	"github.com/docker/docker/pkg/system"
+	units "github.com/docker/go-units"
+	"golang.org/x/sys/windows"
 )
 
 // filterDriver is an HCSShim driver type for the Windows Filter driver.
@@ -114,7 +117,7 @@ func win32FromHresult(hr uintptr) uintptr {
 // https://msdn.microsoft.com/en-us/library/windows/desktop/aa364993(v=vs.85).aspx
 func getFileSystemType(drive string) (fsType string, hr error) {
 	var (
-		modkernel32              = syscall.NewLazyDLL("kernel32.dll")
+		modkernel32              = windows.NewLazySystemDLL("kernel32.dll")
 		procGetVolumeInformation = modkernel32.NewProc("GetVolumeInformationW")
 		buf                      = make([]uint16, 255)
 		size                     = syscall.MAX_PATH + 1
@@ -164,18 +167,16 @@ func (d *Driver) Exists(id string) bool {
 func (d *Driver) CreateReadWrite(id, parent string, opts *graphdriver.CreateOpts) error {
 	if opts != nil {
 		return d.create(id, parent, opts.MountLabel, false, opts.StorageOpt)
-	} else {
-		return d.create(id, parent, "", false, nil)
 	}
+	return d.create(id, parent, "", false, nil)
 }
 
 // Create creates a new read-only layer with the given id.
 func (d *Driver) Create(id, parent string, opts *graphdriver.CreateOpts) error {
 	if opts != nil {
 		return d.create(id, parent, opts.MountLabel, true, opts.StorageOpt)
-	} else {
-		return d.create(id, parent, "", true, nil)
 	}
+	return d.create(id, parent, "", true, nil)
 }
 
 func (d *Driver) create(id, parent, mountLabel string, readOnly bool, storageOpt map[string]string) error {
@@ -260,10 +261,45 @@ func (d *Driver) Remove(id string) error {
 		return err
 	}
 
-	// Get and terminate any template VMs that are currently using the layer
-	computeSystems, err := hcsshim.GetContainers(hcsshim.ComputeSystemQuery{})
-	if err != nil {
-		return err
+	// This retry loop is due to a bug in Windows (Internal bug #9432268)
+	// if GetContainers fails with ErrVmcomputeOperationInvalidState
+	// it is a transient error. Retry until it succeeds.
+	var computeSystems []hcsshim.ContainerProperties
+	retryCount := 0
+	osv := system.GetOSVersion()
+	for {
+		// Get and terminate any template VMs that are currently using the layer.
+		// Note: It is unfortunate that we end up in the graphdrivers Remove() call
+		// for both containers and images, but the logic for template VMs is only
+		// needed for images - specifically we are looking to see if a base layer
+		// is in use by a template VM as a result of having started a Hyper-V
+		// container at some point.
+		//
+		// We have a retry loop for ErrVmcomputeOperationInvalidState and
+		// ErrVmcomputeOperationAccessIsDenied as there is a race condition
+		// in RS1 and RS2 building during enumeration when a silo is going away
+		// for example under it, in HCS. AccessIsDenied added to fix 30278.
+		//
+		// TODO @jhowardmsft - For RS3, we can remove the retries. Also consider
+		// using platform APIs (if available) to get this more succinctly. Also
+		// consider enlighting the Remove() interface to have context of why
+		// the remove is being called - that could improve efficiency by not
+		// enumerating compute systems during a remove of a container as it's
+		// not required.
+		computeSystems, err = hcsshim.GetContainers(hcsshim.ComputeSystemQuery{})
+		if err != nil {
+			if (osv.Build < 15139) &&
+				((err == hcsshim.ErrVmcomputeOperationInvalidState) || (err == hcsshim.ErrVmcomputeOperationAccessIsDenied)) {
+				if retryCount >= 500 {
+					break
+				}
+				retryCount++
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+			return err
+		}
+		break
 	}
 
 	for _, computeSystem := range computeSystems {
